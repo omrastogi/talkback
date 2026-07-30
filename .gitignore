@@ -1,0 +1,12 @@
+# secrets / env
+.env
+*.env
+.env.*
+
+# runtime / generated
+log/
+out/
+in/
+__pycache__/
+*.pyc
+*.pyo

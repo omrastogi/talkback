@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Push-to-talk voice demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #111; }
+  h2 { margin-bottom: 4px; }
+  #talk { width: 100%; height: 140px; font-size: 24px; border: none; border-radius: 16px;
+          background: #2563eb; color: #fff; cursor: pointer; user-select: none; touch-action: none; }
+  #talk.rec { background: #dc2626; }
+  #status { margin: 16px 0; color: #666; font-variant: small-caps; letter-spacing: .5px; }
+  #log { white-space: pre-wrap; line-height: 1.6; }
+  .you { color: #2563eb; margin-top: 10px; }
+  .bot { color: #111; }
+</style>
+</head>
+<body>
+<h2>Push-to-talk voice demo</h2>
+<p style="color:#666;margin-top:0">Hold the button (or hold <b>Space</b>), speak, release. Hold again to interrupt.</p>
+<button id="talk">Hold to talk</button>
+<div id="status">idle</div>
+<div id="log"></div>
+
+<script>
+const talk = document.getElementById('talk');
+const statusEl = document.getElementById('status');
+const log = document.getElementById('log');
+
+let ctx = null, nextStart = 0;       // Web Audio: gapless playback clock
+let mediaRec = null, chunks = [], holding = false;
+
+const wsProto = location.protocol === "https:" ? "wss://" : "ws://";
+const ws = new WebSocket(wsProto + location.host + "/ws");
+ws.binaryType = "arraybuffer";
+
+function setStatus(s) { statusEl.textContent = s; }
+function escapeHtml(s) { return s.replace(/[&<>]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c])); }
+
+ws.onmessage = async (ev) => {
+  if (typeof ev.data === "string") {           // TEXT frame: control / text
+    const m = JSON.parse(ev.data);
+    if (m.type === "transcript") {
+      log.innerHTML += '<div class="you">you: ' + escapeHtml(m.text) + '</div><div class="bot">bot: </div>';
+    } else if (m.type === "reply") {
+      const bots = log.querySelectorAll('.bot');
+      bots[bots.length - 1].textContent += m.text + ' ';
+      setStatus('speaking');
+    } else if (m.type === "done") {
+      setStatus('idle');
+    }
+  } else {                                       // BINARY frame: one wav sentence
+    setStatus('speaking');
+    await enqueueAudio(ev.data);
+  }
+};
+
+async function enqueueAudio(arrayBuffer) {
+  if (!ctx) { ctx = new AudioContext(); nextStart = 0; }
+  const buf = await ctx.decodeAudioData(arrayBuffer.slice(0)); // slice: decode detaches the buffer
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  const startAt = Math.max(ctx.currentTime, nextStart);
+  src.start(startAt);
+  nextStart = startAt + buf.duration;
+}
+
+async function startTalk() {
+  if (holding) return;
+  holding = true;
+  // barge-in: hard-stop any playback by tearing down the audio clock
+  if (ctx) { try { await ctx.close(); } catch (e) {} }
+  ctx = new AudioContext();
+  nextStart = 0;
+
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  chunks = [];
+  mediaRec = new MediaRecorder(stream);
+  mediaRec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+  mediaRec.onstop = () => {
+    ws.send(new Blob(chunks, { type: mediaRec.mimeType }));
+    stream.getTracks().forEach(t => t.stop());
+    setStatus('thinking');
+  };
+  mediaRec.start();
+  talk.classList.add('rec');
+  setStatus('recording');
+}
+
+function stopTalk() {
+  if (!holding) return;
+  holding = false;
+  if (mediaRec && mediaRec.state !== "inactive") mediaRec.stop();
+  talk.classList.remove('rec');
+}
+
+talk.addEventListener('pointerdown', e => { e.preventDefault(); startTalk(); });
+talk.addEventListener('pointerup',   e => { e.preventDefault(); stopTalk(); });
+talk.addEventListener('pointerleave', () => stopTalk());
+window.addEventListener('keydown', e => { if (e.code === "Space" && !e.repeat) { e.preventDefault(); startTalk(); } });
+window.addEventListener('keyup',   e => { if (e.code === "Space") { e.preventDefault(); stopTalk(); } });
+</script>
+</body>
+</html>

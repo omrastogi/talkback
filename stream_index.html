@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streaming push-to-talk voice demo</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: system-ui, sans-serif; color: #111;
+         display: flex; flex-direction: column; height: 100dvh;
+         max-width: 640px; margin: 0 auto; padding: 12px 16px; }
+  header { flex: 0 0 auto; }
+  header h2 { margin: 4px 0; }
+  header p { color: #666; margin: 0 0 8px; font-size: 14px; }
+  /* messages: the only scrolling region, grows to fill space above the fixed button */
+  #log { flex: 1 1 auto; overflow-y: auto; white-space: pre-wrap; line-height: 1.6;
+         border: 1px solid #eee; border-radius: 12px; padding: 12px; }
+  .you { color: #2563eb; margin-top: 10px; }
+  .bot { color: #111; }
+  #live { flex: 0 0 auto; color: #888; font-style: italic; min-height: 1.4em; padding: 6px 2px; }
+  #status { flex: 0 0 auto; color: #666; font-variant: small-caps; letter-spacing: .5px; padding: 2px; }
+  /* hold button: pinned to the bottom, short */
+  #talk { flex: 0 0 auto; width: 100%; height: 64px; font-size: 20px; border: none; border-radius: 14px;
+          background: #2563eb; color: #fff; cursor: pointer; user-select: none; touch-action: none; }
+  #talk.rec { background: #dc2626; }
+</style>
+</head>
+<body>
+<header>
+  <h2>Streaming health voice demo</h2>
+  <p>Hold the button (or <b>Space</b>) and speak — words appear live. Release for the reply.</p>
+</header>
+<div id="log"></div>
+<div id="live"></div>
+<div id="status">idle</div>
+<button id="talk">Hold to talk</button>
+
+<script>
+const talk = document.getElementById('talk');
+const statusEl = document.getElementById('status');
+const liveEl = document.getElementById('live');
+const log = document.getElementById('log');
+
+// --- playback (unchanged from the working demo): its own context + gapless clock ---
+let playCtx = null, nextStart = 0;
+// --- capture ---
+let capCtx = null, micStream = null, source = null, recNode = null, holding = false;
+
+const wsProto = location.protocol === "https:" ? "wss://" : "ws://";
+const ws = new WebSocket(wsProto + location.host + "/ws-stream");
+ws.binaryType = "arraybuffer";
+
+function setStatus(s) { statusEl.textContent = s; }
+function escapeHtml(s) { return s.replace(/[&<>]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c])); }
+
+ws.onmessage = async (ev) => {
+  if (typeof ev.data === "string") {
+    const m = JSON.parse(ev.data);
+    if (m.type === "partial") {
+      liveEl.textContent = "you (live): " + m.text;
+    } else if (m.type === "transcript") {
+      liveEl.textContent = "";
+      log.innerHTML += '<div class="you">you: ' + escapeHtml(m.text) + '</div><div class="bot">bot: </div>';
+      log.scrollTop = log.scrollHeight;
+      setStatus('thinking');
+    } else if (m.type === "reply") {
+      const bots = log.querySelectorAll('.bot');
+      bots[bots.length - 1].textContent += m.text + ' ';
+      log.scrollTop = log.scrollHeight;
+      setStatus('speaking');
+    } else if (m.type === "done") {
+      setStatus('idle');
+    }
+  } else {
+    setStatus('speaking');
+    await enqueueAudio(ev.data);
+  }
+};
+
+async function enqueueAudio(arrayBuffer) {
+  if (!playCtx) { playCtx = new AudioContext(); nextStart = 0; }
+  const buf = await playCtx.decodeAudioData(arrayBuffer.slice(0)); // slice: decode detaches the buffer
+  const src = playCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(playCtx.destination);
+  const startAt = Math.max(playCtx.currentTime, nextStart);
+  src.start(startAt);
+  nextStart = startAt + buf.duration;
+}
+
+const WORKLET = `
+class Recorder extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (ch) this.port.postMessage(ch.slice(0)); // copy the Float32 frame out
+    return true;
+  }
+}
+registerProcessor('recorder', Recorder);
+`;
+
+async function startTalk() {
+  if (holding) return;
+  holding = true;
+  // barge-in: hard-stop playback by tearing down the playback clock
+  if (playCtx) { try { await playCtx.close(); } catch (e) {} }
+  playCtx = new AudioContext();
+  nextStart = 0;
+
+  capCtx = new AudioContext({ sampleRate: 16000 });
+  ws.send(JSON.stringify({ type: "start", sampleRate: capCtx.sampleRate }));
+
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  source = capCtx.createMediaStreamSource(micStream);
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+  await capCtx.audioWorklet.addModule(url);
+  recNode = new AudioWorkletNode(capCtx, "recorder");
+  recNode.port.onmessage = (e) => {
+    const f = e.data;                       // Float32Array frame
+    const i16 = new Int16Array(f.length);
+    for (let i = 0; i < f.length; i++) {
+      const s = Math.max(-1, Math.min(1, f[i]));
+      i16[i] = s * 32767;
+    }
+    if (ws.readyState === WebSocket.OPEN) ws.send(i16.buffer);
+  };
+  source.connect(recNode);
+  recNode.connect(capCtx.destination);      // keep the graph pulling (worklet emits silence)
+
+  talk.classList.add('rec');
+  liveEl.textContent = "";
+  setStatus('recording');
+}
+
+async function stopTalk() {
+  if (!holding) return;
+  holding = false;
+  ws.send(JSON.stringify({ type: "end" }));
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (source) source.disconnect();
+  if (recNode) recNode.disconnect();
+  if (capCtx) { try { await capCtx.close(); } catch (e) {} capCtx = null; }
+  talk.classList.remove('rec');
+  setStatus('thinking');
+}
+
+talk.addEventListener('pointerdown', e => { e.preventDefault(); startTalk(); });
+talk.addEventListener('pointerup',   e => { e.preventDefault(); stopTalk(); });
+talk.addEventListener('pointerleave', () => stopTalk());
+window.addEventListener('keydown', e => { if (e.code === "Space" && !e.repeat) { e.preventDefault(); startTalk(); } });
+window.addEventListener('keyup',   e => { if (e.code === "Space") { e.preventDefault(); stopTalk(); } });
+</script>
+</body>
+</html>
