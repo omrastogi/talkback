@@ -5,6 +5,7 @@
 
 # runtime / generated
 log/
+logs/
 out/
 in/
 __pycache__/

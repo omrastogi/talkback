@@ -23,6 +23,10 @@
 <div id="status">idle</div>
 <div id="log"></div>
 
+<button id="dbgToggle" style="position:fixed;top:8px;right:8px;font-size:12px;padding:2px 8px;cursor:pointer;">debug</button>
+<pre id="dbg" style="position:fixed;top:34px;right:8px;margin:0;padding:8px;max-width:260px;
+     background:#111;color:#0f0;font:12px/1.5 monospace;border-radius:8px;display:none;">no turns yet</pre>
+
 <script>
 const talk = document.getElementById('talk');
 const statusEl = document.getElementById('status');
@@ -30,6 +34,42 @@ const log = document.getElementById('log');
 
 let ctx = null, nextStart = 0;       // Web Audio: gapless playback clock
 let mediaRec = null, chunks = [], holding = false;
+
+// --- playback telemetry (measurement only; off the audio path) ---
+// All local marks use performance.now() (ms). scheduled_* are AudioContext clock (s).
+let turnTel = null;                  // current turn's telemetry accumulator (null between turns)
+let pendingMeta = null;              // last audio_meta, paired with the next binary frame
+let lastEndOfSpeech = null;          // performance.now() at last PTT release, snapshotted per turn
+const dbgEl = document.getElementById('dbg');
+const dbgToggle = document.getElementById('dbgToggle');
+dbgToggle.addEventListener('click', () => {
+  dbgEl.style.display = dbgEl.style.display === 'none' ? 'block' : 'none';
+});
+
+function newTurn(turn_id) {
+  turnTel = { turn_id, end_of_speech_ts: lastEndOfSpeech,
+              first_audio_recv_ts: null, first_audio_play_ts: null,
+              underrun_count: 0, total_gap_ms: 0, prev_sched_end: null, chunks: [] };
+}
+
+function finishTurn() {
+  if (!turnTel) return;
+  const t = turnTel; turnTel = null;
+  const eos = t.end_of_speech_ts;
+  t.time_to_first_audio_recv = (eos != null && t.first_audio_recv_ts != null) ? t.first_audio_recv_ts - eos : null;
+  t.time_to_first_audio_play = (eos != null && t.first_audio_play_ts != null) ? t.first_audio_play_ts - eos : null;
+  t.chunk_count = t.chunks.length;
+  delete t.prev_sched_end;           // scratch field, not worth shipping
+  try {                              // fail silently — telemetry must never break audio
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "client_telemetry", ...t }));
+  } catch (e) {}
+  if (dbgEl.style.display !== 'none') {
+    dbgEl.textContent =
+      `turn ${t.turn_id}\nchunks: ${t.chunk_count}\nunderruns: ${t.underrun_count}\n` +
+      `total gap: ${t.total_gap_ms.toFixed(1)} ms\n` +
+      `t->first play: ${t.time_to_first_audio_play != null ? t.time_to_first_audio_play.toFixed(0)+' ms' : 'n/a'}`;
+  }
+}
 
 const wsProto = location.protocol === "https:" ? "wss://" : "ws://";
 const ws = new WebSocket(wsProto + location.host + "/ws");
@@ -47,24 +87,55 @@ ws.onmessage = async (ev) => {
       const bots = log.querySelectorAll('.bot');
       bots[bots.length - 1].textContent += m.text + ' ';
       setStatus('speaking');
+    } else if (m.type === "turn_start") {
+      newTurn(m.turn_id);
+    } else if (m.type === "audio_meta") {
+      pendingMeta = m;                           // paired with the very next binary frame
     } else if (m.type === "done") {
+      finishTurn();
       setStatus('idle');
     }
   } else {                                       // BINARY frame: one wav sentence
+    const recvTs = performance.now();
+    const meta = pendingMeta; pendingMeta = null;
+    if (turnTel && turnTel.first_audio_recv_ts === null) turnTel.first_audio_recv_ts = recvTs;
     setStatus('speaking');
-    await enqueueAudio(ev.data);
+    await enqueueAudio(ev.data, meta, recvTs);
   }
 };
 
-async function enqueueAudio(arrayBuffer) {
+async function enqueueAudio(arrayBuffer, meta, recvTs) {
   if (!ctx) { ctx = new AudioContext(); nextStart = 0; }
   const buf = await ctx.decodeAudioData(arrayBuffer.slice(0)); // slice: decode detaches the buffer
+  const decodeDoneTs = performance.now();
   const src = ctx.createBufferSource();
   src.buffer = buf;
   src.connect(ctx.destination);
   const startAt = Math.max(ctx.currentTime, nextStart);
   src.start(startAt);
   nextStart = startAt + buf.duration;
+
+  if (turnTel) {
+    // underrun: this chunk is scheduled after the previous one already ended (buffer drained)
+    if (turnTel.prev_sched_end !== null && startAt > turnTel.prev_sched_end + 1e-4) {
+      turnTel.underrun_count++;
+      turnTel.total_gap_ms += (startAt - turnTel.prev_sched_end) * 1000;
+    }
+    turnTel.prev_sched_end = nextStart;
+    // project the audio-clock start onto the performance.now() timeline (both run at real time)
+    if (turnTel.first_audio_play_ts === null) {
+      turnTel.first_audio_play_ts = performance.now() + Math.max(0, startAt - ctx.currentTime) * 1000;
+    }
+    turnTel.chunks.push({
+      idx: meta ? meta.idx : null,
+      server_send_ts: meta ? meta.server_send_ts : null,
+      client_recv_ts: recvTs,
+      decode_done_ts: decodeDoneTs,
+      scheduled_start_ts: startAt,
+      scheduled_end_ts: nextStart,
+      duration_s: buf.duration,
+    });
+  }
 }
 
 async function startTalk() {
@@ -80,6 +151,7 @@ async function startTalk() {
   mediaRec = new MediaRecorder(stream);
   mediaRec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
   mediaRec.onstop = () => {
+    lastEndOfSpeech = performance.now();     // mic capture stopped — start of the "to first audio" clock
     ws.send(new Blob(chunks, { type: mediaRec.mimeType }));
     stream.getTracks().forEach(t => t.stop());
     setStatus('thinking');

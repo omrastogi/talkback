@@ -56,7 +56,7 @@ def resolve_backend(backend=None, model=None):
         return None, os.environ.get("OPENAI_API_KEY"), model or "gpt-4o-mini"
     return (os.environ.get("PARCS_BASE_URL", PARCS_DEFAULT_URL),
             os.environ.get("PARCS_API_KEY"),
-            model or os.environ.get("PARCS_MODEL", "gemma4:12b"))
+            model or os.environ.get("PARCS_MODEL", "gemma4:12b:fast"))
 
 
 def make_client(backend=None, model=None, async_=False):
@@ -67,10 +67,56 @@ def make_client(backend=None, model=None, async_=False):
     return cls(base_url=base_url, api_key=api_key), model
 
 
+# --- VAD / tap-to-talk turn-taking -----------------------------------------------------
+# Runtime config (env, load_env() first so .env and the shell both work). Defaults live in
+# vad.turn.TurnParams — the single source of truth — and env only overrides them, so there is
+# no second copy of the numbers to drift.
+TURN_MODE_DEFAULT = "tap"                # "tap" (VAD endpointing) | "hold" (button-up = EOU)
+VAD_PROVIDER_OVERRIDE_DEFAULT = "auto"   # "auto" | "cuda" | "cpu"
+
+_VAD_ENV = {   # TurnParams field -> (env var, caster)
+    "vad_speech_threshold": ("VAD_SPEECH_THRESHOLD", float),
+    "vad_silence_threshold": ("VAD_SILENCE_THRESHOLD", float),
+    "vad_onset_frames": ("VAD_ONSET_FRAMES", int),
+    "vad_hangover_ms": ("VAD_HANGOVER_MS", int),
+    "vad_prespeech_ms": ("VAD_PRESPEECH_MS", int),
+    "vad_max_utterance_s": ("VAD_MAX_UTTERANCE_S", float),
+    "vad_arm_timeout_s": ("VAD_ARM_TIMEOUT_S", float),
+}
+
+
+def turn_mode():
+    load_env()
+    return os.environ.get("TURN_MODE", TURN_MODE_DEFAULT)
+
+
+def vad_provider_override():
+    load_env()
+    return os.environ.get("VAD_PROVIDER_OVERRIDE", VAD_PROVIDER_OVERRIDE_DEFAULT)
+
+
+def vad_params():
+    """Build a vad.turn.TurnParams from env overrides (imported lazily so config stays
+    importable-before-torch and cheap on boxes without the vad package on the path)."""
+    load_env()
+    import dataclasses
+
+    from vad.turn import TurnParams
+    overrides = {field: cast(os.environ[env])
+                 for field, (env, cast) in _VAD_ENV.items() if env in os.environ}
+    return dataclasses.replace(TurnParams(), **overrides) if overrides else TurnParams()
+
+
 if __name__ == "__main__":   # self-check: backend resolution picks the right url + model
     os.environ.setdefault("OPENAI_API_KEY", "test")
     base, _, mdl = resolve_backend("openai")
     assert base is None and mdl == "gpt-4o-mini", (base, mdl)
-    base, _, mdl = resolve_backend("parcs", "gemma4:12b")
-    assert base and "parcs" in base and mdl == "gemma4:12b", (base, mdl)
+    base, _, mdl = resolve_backend("parcs", "gemma4:12b:fast")
+    assert base and "parcs" in base and mdl == "gemma4:12b:fast", (base, mdl)
+    # vad config: defaults come through untouched, and an env override lands as the right type.
+    assert turn_mode() == "tap" and vad_provider_override() == "auto"
+    assert vad_params().vad_hangover_ms == 600
+    os.environ["VAD_HANGOVER_MS"] = "450"
+    assert vad_params().vad_hangover_ms == 450
+    del os.environ["VAD_HANGOVER_MS"]
     print("config OK")

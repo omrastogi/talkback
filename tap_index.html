@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tap-to-talk voice demo (VAD endpointing)</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: system-ui, sans-serif; color: #111;
+         display: flex; flex-direction: column; height: 100dvh;
+         max-width: 640px; margin: 0 auto; padding: 12px 16px; }
+  header { flex: 0 0 auto; }
+  header h2 { margin: 4px 0; }
+  header p { color: #666; margin: 0 0 8px; font-size: 14px; }
+  #log { flex: 1 1 auto; overflow-y: auto; white-space: pre-wrap; line-height: 1.6;
+         border: 1px solid #eee; border-radius: 12px; padding: 12px; }
+  .you { color: #2563eb; margin-top: 10px; }
+  .bot { color: #111; }
+  /* VAD row: state chip + live speech-probability meter (essential for tuning hangover by feel) */
+  #vad { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; padding: 8px 2px; }
+  #state { font-variant: small-caps; letter-spacing: .5px; font-weight: 600; min-width: 92px;
+           padding: 3px 8px; border-radius: 8px; background: #eee; color: #555; text-align: center; }
+  #state.ARMED   { background: #fef3c7; color: #92400e; }
+  #state.SPEECH  { background: #dcfce7; color: #166534; }
+  #state.TRAILING{ background: #ffedd5; color: #9a3412; }
+  #meterwrap { flex: 1 1 auto; height: 10px; background: #f1f5f9; border-radius: 6px; overflow: hidden; }
+  #meter { height: 100%; width: 0%; background: #22c55e; transition: width .06s linear; }
+  #prob { flex: 0 0 auto; width: 44px; text-align: right; color: #888; font-variant-numeric: tabular-nums; }
+  #status { flex: 0 0 auto; color: #666; font-variant: small-caps; letter-spacing: .5px; padding: 2px; }
+  #talk { flex: 0 0 auto; width: 100%; height: 64px; font-size: 20px; border: none; border-radius: 14px;
+          background: #2563eb; color: #fff; cursor: pointer; user-select: none; touch-action: none; }
+  #talk:disabled { background: #cbd5e1; color: #eef2f7; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <h2>Tap-to-talk health voice demo</h2>
+  <p>Tap once (or <b>Space</b>) and speak — VAD ends your turn when you stop. Watch the meter.</p>
+</header>
+<div id="log"></div>
+<div id="vad">
+  <span id="state">idle</span>
+  <div id="meterwrap"><div id="meter"></div></div>
+  <span id="prob">0.00</span>
+</div>
+<div id="status">tap to begin</div>
+<button id="talk">Tap to talk</button>
+
+<script>
+const talk = document.getElementById('talk');
+const statusEl = document.getElementById('status');
+const stateEl = document.getElementById('state');
+const meterEl = document.getElementById('meter');
+const probEl = document.getElementById('prob');
+const log = document.getElementById('log');
+
+let playCtx = null, nextStart = 0;                 // gapless playback clock (same as streaming demo)
+let capCtx = null, micStream = null, source = null, recNode = null, micOpen = false;
+let clientState = "IDLE";                           // tap allowed only when IDLE
+
+const wsProto = location.protocol === "https:" ? "wss://" : "ws://";
+const ws = new WebSocket(wsProto + location.host + "/ws-stream");
+ws.binaryType = "arraybuffer";
+
+function setStatus(s) { statusEl.textContent = s; }
+function escapeHtml(s) { return s.replace(/[&<>]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c])); }
+function setVad(state, prob) {
+  stateEl.textContent = state.toLowerCase();
+  stateEl.className = state;                        // color via CSS class
+  meterEl.style.width = Math.round(prob * 100) + '%';
+  probEl.textContent = prob.toFixed(2);
+}
+function idle() { clientState = "IDLE"; talk.disabled = false; talk.textContent = "Tap to talk"; }
+
+ws.onmessage = async (ev) => {
+  if (typeof ev.data !== "string") { setStatus('speaking'); return enqueueAudio(ev.data); }
+  const m = JSON.parse(ev.data);
+  if (m.type === "vad_state") {
+    setVad(m.state, m.prob);
+  } else if (m.type === "transcript") {
+    log.innerHTML += '<div class="you">you: ' + escapeHtml(m.text) + '</div><div class="bot">bot: </div>';
+    log.scrollTop = log.scrollHeight; setStatus('thinking');
+  } else if (m.type === "reply") {
+    const bots = log.querySelectorAll('.bot');
+    bots[bots.length - 1].textContent += m.text + ' ';
+    log.scrollTop = log.scrollHeight; setStatus('speaking');
+  } else if (m.type === "done") {
+    setStatus('your turn'); setVad('IDLE', 0); idle();
+  } else if (m.type === "arm_timeout") {
+    setStatus('no speech — tap again'); setVad('IDLE', 0); idle();
+  } else if (m.type === "vad_error") {
+    setStatus('VAD unavailable'); idle();
+  }
+};
+
+async function enqueueAudio(arrayBuffer) {
+  if (!playCtx) { playCtx = new AudioContext(); nextStart = 0; }
+  const buf = await playCtx.decodeAudioData(arrayBuffer.slice(0));
+  const src = playCtx.createBufferSource();
+  src.buffer = buf; src.connect(playCtx.destination);
+  const startAt = Math.max(playCtx.currentTime, nextStart);
+  src.start(startAt); nextStart = startAt + buf.duration;
+}
+
+const WORKLET = `
+class Recorder extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (ch) this.port.postMessage(ch.slice(0));
+    return true;
+  }
+}
+registerProcessor('recorder', Recorder);
+`;
+
+// Open the mic ONCE and stream continuously (never gated by the tap button). Requires a user
+// gesture, so it is opened on the first tap; from then on audio flows for every turn, which is
+// what makes the prespeech ring (server-side) able to recover the clipped onset.
+async function openMic() {
+  if (micOpen) return;
+  capCtx = new AudioContext({ sampleRate: 16000 });
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  source = capCtx.createMediaStreamSource(micStream);
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+  await capCtx.audioWorklet.addModule(url);
+  recNode = new AudioWorkletNode(capCtx, "recorder");
+  recNode.port.onmessage = (e) => {
+    const f = e.data, i16 = new Int16Array(f.length);
+    for (let i = 0; i < f.length; i++) { const s = Math.max(-1, Math.min(1, f[i])); i16[i] = s * 32767; }
+    if (ws.readyState === WebSocket.OPEN) ws.send(i16.buffer);
+  };
+  source.connect(recNode);
+  recNode.connect(capCtx.destination);               // keep the graph pulling (worklet emits silence)
+  ws.send(JSON.stringify({ type: "start", sampleRate: capCtx.sampleRate }));
+  micOpen = true;
+}
+
+async function tap() {
+  if (clientState !== "IDLE") return;                // disabled while ARMED/SPEECH/TRAILING/thinking
+  await openMic();
+  // barge-in is out of scope: hard-stop any current playback so the reply doesn't talk over you
+  if (playCtx) { try { await playCtx.close(); } catch (e) {} playCtx = null; nextStart = 0; }
+  clientState = "ARMED"; talk.disabled = true; talk.textContent = "listening…";
+  setStatus('listening'); setVad('ARMED', 0);
+  ws.send(JSON.stringify({ type: "turn_start" }));
+}
+
+talk.addEventListener('click', tap);
+window.addEventListener('keydown', e => { if (e.code === "Space" && !e.repeat) { e.preventDefault(); tap(); } });
+</script>
+</body>
+</html>
