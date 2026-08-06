@@ -177,21 +177,21 @@ voice agent** — warm and concise, one or two spoken-style sentences, with hard
 licensed clinician when unsure). Edit `config.SYS_PROMPT` to change the persona everywhere.
 `load` in the timing line is client init; `infer` is the API round-trip.
 
-### Persona: `--persona robin`
+### Conversation engine: Robin
 
-`server.py` also accepts `--persona {default,robin}` (default `default`; env `PERSONA`).
-`robin` swaps the reply step for `robin_convo.py` — a port of the RECOVER Alexa skill's
-`conversation()` (from `robin-ca-mirror/backend/recover/alexa.py`) with its own prompt
-(`robin_prompt.txt`). It keeps the sentinel logic verbatim (DELETE_MESSAGE confirm/redact,
-affirmation gate, `CONVERSATION_END` goodbye) but replaces the original's SQLAlchemy +
-Chroma + weather/calendar infra with in-memory per-connection history and two optional
-hooks: `ctx` (prompt placeholders like weather/schedule/profile) and `rag(user_text)`
-(patient-history retrieval) — both default to blank, so wire real data in when needed. Uses
-the same `--backend`/key as everything else; no credentials are copied from the source repo.
+`server.py`'s reply step is `robin_conversation.process_turn()` — the standalone package in
+`robin_conversation/` (intent classification, the delete-confirmation sentinel gate,
+weather/schedule/capabilities replies, and the default LLM turn), ported from the RECOVER
+Alexa skill's conversation engine with Flask/SQLAlchemy/Chroma/AWS Bedrock removed. It keeps
+per-connection history in memory and builds its own prompt context (real weather via
+Open-Meteo, a bundled dummy schedule, optional per-user profile files) instead of the
+DB-backed original. Uses the same `--backend`/key as everything else, via env vars
+(`OPENAI_API_KEY`/`OPENAI_BASE_URL`/`CHAT_MODEL_ID`/`INTENT_MODEL_ID`) set from the resolved
+backend — no credentials are copied from the source repo.
 
 ```bash
-conda run -n voice python server.py --persona robin --backend openai
-python robin_convo.py     # offline self-check (fake client, no network)
+conda run -n voice python server.py --backend openai
+python -m robin_conversation.test_conversation   # offline REPL against the same engine
 ```
 
 ## Timing contract

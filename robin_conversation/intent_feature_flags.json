@@ -1,0 +1,13 @@
+{
+  "default": {
+    "affirmation": true,
+    "reminder": true,
+    "delete_message": true,
+    "end_conversation": true
+  },
+  "users": {
+    "example-user-id-to-opt-out": {
+      "reminder": false
+    }
+  }
+}

@@ -1,7 +1,8 @@
-"""Push-to-talk realtime voice server: browser mic -> STT -> streaming LLM -> sentence TTS -> browser.
+"""Push-to-talk realtime voice server: browser mic -> STT -> Robin's conversation engine -> sentence TTS -> browser.
 
-Models load once at import (both resident on the 4 GB card). LLM is remote (AsyncOpenAI, streaming);
-Parakeet + Kokoro are blocking, so they run in threads to keep the event loop free.
+Models load once at import (both resident on the 4 GB card). The LLM turn is remote (blocking
+robin_conversation.process_turn(), run in a thread); Parakeet + Kokoro are blocking too, so they
+also run in threads to keep the event loop free.
 
     conda run -n voice uvicorn server:app --host 0.0.0.0 --port 8000
     # then open http://localhost:8000 in the Windows browser
@@ -27,7 +28,6 @@ import torch
 import torchaudio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from openai import AsyncOpenAI
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VOICE = "af_heart"
@@ -86,8 +86,6 @@ _ap = argparse.ArgumentParser(add_help=False)
 _ap.add_argument("--backend", choices=["openai", "parcs"],
                  default=os.environ.get("LLM_BACKEND", "parcs"))
 _ap.add_argument("--model", default=os.environ.get("LLM_MODEL"))
-_ap.add_argument("--persona", choices=["default", "robin"],
-                 default=os.environ.get("PERSONA", "default"))   # robin = ported RECOVER conversation
 _ap.add_argument("--host", default="0.0.0.0")
 _ap.add_argument("--port", type=int, default=8000)
 ARGS, _ = _ap.parse_known_args()
@@ -102,15 +100,20 @@ from kokoro import KPipeline
 t = time.time(); pipe = KPipeline(lang_code="a"); TTS_LOAD = time.time() - t
 for _ in pipe("Ready.", voice=VOICE):   # warm Kokoro (first synth compiles kernels ~3s)
     pass
-aclient = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)  # base_url=None -> OpenAI
-# robin persona: ported RECOVER conversation() (robin_convo.py). It's blocking, so it uses a sync
-# client run in a thread. Same backend/key as above — no hardcoded credentials.
-import robin_convo
-from openai import OpenAI
-robin_client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY) if ARGS.persona == "robin" else None
+# Robin's conversation engine (robin_conversation package) -- intent classification, the
+# delete-confirmation gate, weather/schedule/capabilities replies, and the default LLM turn.
+# It's blocking, so it runs in a thread. It reads its OpenAI-compatible client config from
+# env vars (see robin_conversation/llm.py); point those at the backend resolved above -- same
+# backend/key as everywhere else, no hardcoded credentials.
+os.environ["OPENAI_API_KEY"] = LLM_API_KEY or ""
+if LLM_BASE_URL:
+    os.environ["OPENAI_BASE_URL"] = LLM_BASE_URL
+os.environ["CHAT_MODEL_ID"] = MODEL
+os.environ["INTENT_MODEL_ID"] = MODEL
+from robin_conversation import process_turn
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-log.info("[ready] STT %.1fs · TTS %.1fs · both resident on %s · LLM=%s [%s] · persona=%s · logs -> %s",
-         STT_LOAD, TTS_LOAD, _DEVICE, MODEL, ARGS.backend, ARGS.persona, LOG_DIR)
+log.info("[ready] STT %.1fs · TTS %.1fs · both resident on %s · LLM=%s [%s] · logs -> %s",
+         STT_LOAD, TTS_LOAD, _DEVICE, MODEL, ARGS.backend, LOG_DIR)
 
 # --- VAD provider: choose once at process start (never per connection). Non-fatal: a CUDA
 # probe failure falls back to CPU. On this 4 GB card CPU is the safe operational pick (keeps
@@ -200,52 +203,6 @@ async def send_sentence(ws, sentence, reply_chunks, idx):
     return dt
 
 
-async def stream_reply(ws, messages, transcript, turn_id):
-    """LLM token stream -> sentence chunks -> TTS audio frames. Appends the user + assistant
-    turns to `messages`, sends the final {"type":"done"}, and returns
-    (full_reply, reply_chunks, ttft, ttfs, tts_total, llm_dt). Shared by /ws and /ws-stream.
-    Emits {"type":"turn_start"} at the start and a monotonic per-turn `idx` on each audio frame."""
-    messages.append({"role": "user", "content": transcript})
-    await ws.send_json({"type": "turn_start", "turn_id": turn_id})
-    t_llm = time.perf_counter()
-    stream = await aclient.chat.completions.create(model=MODEL, messages=messages, stream=True)
-    ttft = ttfs = None
-    reply_chunks, tts_total, idx = [], 0.0, 0
-    buf, full, first_flush = "", "", True
-
-    async def flush(sentence):
-        nonlocal ttfs, tts_total, first_flush, idx
-        if not sentence:
-            return
-        if ttfs is None:
-            ttfs = time.perf_counter() - t_llm
-        tts_total += await send_sentence(ws, sentence, reply_chunks, idx)
-        idx += 1
-        first_flush = False
-
-    async for chunk in stream:
-        piece = chunk.choices[0].delta.content or ""
-        if not piece:
-            continue
-        if ttft is None:
-            ttft = time.perf_counter() - t_llm
-        buf += piece
-        full += piece
-        pattern = r"[.!?,]" if first_flush else r"[.!?]"   # break on comma for the first flush
-        while (m := re.search(pattern, buf)):
-            sentence, buf = buf[:m.end()].strip(), buf[m.end():]
-            await flush(sentence)
-            pattern = r"[.!?]"
-        if first_flush and len(buf) > 60:
-            await flush(buf.strip())
-            buf = ""
-    await flush(buf.strip())
-    llm_dt = time.perf_counter() - t_llm
-    messages.append({"role": "assistant", "content": full})
-    await ws.send_json({"type": "done"})
-    return full, reply_chunks, ttft, ttfs, tts_total, llm_dt
-
-
 def save_reply(reply_chunks, tid):
     """Concatenate the spoken reply chunks to log/<tid>.reply.wav (if any). Returns the path."""
     reply_wav = os.path.join(LOG_DIR, f"{tid}.reply.wav")
@@ -257,19 +214,19 @@ def save_reply(reply_chunks, tid):
 _SENT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
-async def robin_reply(ws, history, transcript, turn_id):
-    """RECOVER-persona reply: robin_convo.conversation() -> sentence TTS. Mirrors stream_reply's
-    control messages (turn_start / reply / audio_meta / done) so the client and playback telemetry
-    are identical; only the text source differs (a blocking full reply, not a token stream).
-    Returns the same tuple shape as stream_reply."""
+async def robin_reply(ws, history, transcript, turn_id, user_id):
+    """Robin's reply: robin_conversation.process_turn() -> sentence TTS. Sends the same control
+    messages (turn_start / reply / audio_meta / done) the client and playback telemetry expect;
+    the LLM call is a blocking full reply (no token streaming), split into sentences after the
+    fact. Returns (full_reply, reply_chunks, ttft, ttfs, tts_total, llm_dt) -- ttft equals
+    llm_dt since there's no streaming first-token to distinguish it from."""
     await ws.send_json({"type": "turn_start", "turn_id": turn_id})
     t_llm = time.perf_counter()
-    reply = await asyncio.to_thread(robin_convo.conversation, history, transcript,
-                                    client=robin_client, model=MODEL)
+    result = await asyncio.to_thread(process_turn, history, transcript, user_id=user_id)
     llm_dt = time.perf_counter() - t_llm
-    spoken = reply.replace("CONVERSATION_END", "").replace("DELETE_MESSAGE", "").strip()
+    reply = result["reply"]
     reply_chunks, tts_total, idx, ttfs = [], 0.0, 0, None
-    for sentence in _SENT_RE.split(spoken):
+    for sentence in _SENT_RE.split(reply.strip()):
         sentence = sentence.strip()
         if not sentence:
             continue
@@ -296,8 +253,7 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     session = time.strftime("%Y%m%d_%H%M%S")
     log.info("ws connected  session=%s", session)
-    messages = [{"role": "system", "content": config.SYS_PROMPT}]   # per-connection memory
-    robin_history = []                                              # per-connection memory for --persona robin
+    history = []                                              # per-connection conversation memory
     turn = 0
     try:
         while True:
@@ -328,10 +284,7 @@ async def ws_endpoint(ws: WebSocket):
             log.info("turn %d  stt %.2fs -> %r", turn, stt_dt, transcript)
             await ws.send_json({"type": "transcript", "text": transcript})
 
-            if ARGS.persona == "robin":
-                full, reply_chunks, ttft, ttfs, tts_total, llm_dt = await robin_reply(ws, robin_history, transcript, tid)
-            else:
-                full, reply_chunks, ttft, ttfs, tts_total, llm_dt = await stream_reply(ws, messages, transcript, tid)
+            full, reply_chunks, ttft, ttfs, tts_total, llm_dt = await robin_reply(ws, history, transcript, tid, session)
 
             reply_wav = save_reply(reply_chunks, tid)
             turn_total = time.perf_counter() - t_turn
@@ -359,11 +312,11 @@ async def stream_index():
     return FileResponse(os.path.join(HERE, "stream_index.html"))
 
 
-async def _finalize_turn(ws, session, audio16k, sr, messages, robin_history, tid, stages):
+async def _finalize_turn(ws, session, audio16k, sr, history, tid, stages):
     """Shared turn finalize (tap and hold): transcribe the utterance, send the transcript, run
-    the persona/stream reply, save it, and write the per-turn VAD bench record. `stages` carries
-    the raw pre-STT timestamps the caller already filled (t_turn_start, t_speech_onset, t_eou).
-    STT/LLM/TTS are called exactly as before — this only threads instrumentation through."""
+    Robin's reply, save it, and write the per-turn VAD bench record. `stages` carries the raw
+    pre-STT timestamps the caller already filled (t_turn_start, t_speech_onset, t_eou). STT/LLM/
+    TTS are called exactly as before — this only threads instrumentation through."""
     if audio16k is None or len(audio16k) == 0:                  # never silently drop: report empty
         await ws.send_json({"type": "transcript", "text": ""})
         await ws.send_json({"type": "done"})
@@ -378,16 +331,13 @@ async def _finalize_turn(ws, session, audio16k, sr, messages, robin_history, tid
     await ws.send_json({"type": "transcript", "text": transcript})
 
     t_reply = time.perf_counter()
-    if ARGS.persona == "robin":
-        full, reply_chunks, ttft, ttfs, tts_total, llm_dt = await robin_reply(ws, robin_history, transcript, tid)
-    else:
-        full, reply_chunks, ttft, ttfs, tts_total, llm_dt = await stream_reply(ws, messages, transcript, tid)
+    full, reply_chunks, ttft, ttfs, tts_total, llm_dt = await robin_reply(ws, history, transcript, tid, session)
     stages["t_llm_first_token"] = (t_reply + ttft) if ttft is not None else None
     stages["t_tts_first_frame"] = (t_reply + ttfs) if ttfs is not None else None
 
     reply_wav = save_reply(reply_chunks, tid)
     log.info("turn %s  reply (tts=%.2f llm=%.2f) %r -> %s", tid, tts_total, llm_dt, full.strip(), reply_wav)
-    rec = {"session": session, "tid": tid, "persona": ARGS.persona, "backend": ARGS.backend,
+    rec = {"session": session, "tid": tid, "backend": ARGS.backend,
            "transcript": transcript, "reply": full.strip(), **stages}
     asyncio.create_task(asyncio.to_thread(_append_bench, f"vad_{session}", rec))
 
@@ -400,15 +350,14 @@ async def ws_stream_endpoint(ws: WebSocket):
     await ws.accept()
     session = time.strftime("%Y%m%d_%H%M%S")
     log.info("ws-stream connected  session=%s  turn_mode=%s", session, TURN_MODE)
-    messages = [{"role": "system", "content": config.SYS_PROMPT}]
-    robin_history = []
+    history = []                                              # per-connection conversation memory
     if TURN_MODE == "tap":
-        await _run_tap(ws, session, messages, robin_history)
+        await _run_tap(ws, session, history)
     else:
-        await _run_hold(ws, session, messages, robin_history)
+        await _run_hold(ws, session, history)
 
 
-async def _run_hold(ws, session, messages, robin_history):
+async def _run_hold(ws, session, history):
     """hold-to-talk: {start} on button-down, PCM frames, {end}=EOU (exactly as before). Live
     partials via O(n^2) full re-decode. Kept intact as the control path; only instrumentation
     is added around it."""
@@ -434,7 +383,7 @@ async def _run_hold(ws, session, messages, robin_history):
                               "t_eou": time.perf_counter(),
                               "vad_speech_duration_ms": None, "vad_hangover_used_ms": None}
                     audio = np.concatenate(buf) if buf else None
-                    await _finalize_turn(ws, session, audio, sr, messages, robin_history, tid, stages)
+                    await _finalize_turn(ws, session, audio, sr, history, tid, stages)
                     buf, n_samples, last_partial = [], 0, 0
             elif msg.get("bytes") is not None:
                 frame = np.frombuffer(msg["bytes"], dtype="<i2").astype("float32") / 32768.0
@@ -452,7 +401,7 @@ async def _run_hold(ws, session, messages, robin_history):
     log.info("ws-stream(hold) disconnected  session=%s turns=%d", session, turn)
 
 
-async def _run_tap(ws, session, messages, robin_history):
+async def _run_tap(ws, session, history):
     """tap-to-talk: mic streams continuously; {turn_start} arms; Silero VAD decides EOU. The
     prespeech ring recovers the clipped onset. VAD runs during IDLE too (barge-in later). Fails
     to a safe state — a per-connection SileroVAD init failure degrades this connection to hold
@@ -467,7 +416,7 @@ async def _run_tap(ws, session, messages, robin_history):
     except Exception as e:                                      # model missing / ORT init failure
         log.warning("tap: SileroVAD init failed (%s) — degrading this connection to hold", e)
         await ws.send_json({"type": "vad_error", "text": "VAD unavailable, using hold"})
-        return await _run_hold(ws, session, messages, robin_history)
+        return await _run_hold(ws, session, history)
 
     ingest, sr = None, 16000
     turn, tid, stages = 0, None, None
@@ -516,7 +465,7 @@ async def _run_tap(ws, session, messages, robin_history):
                     stages["vad_speech_duration_ms"] = ingest.machine.last_speech_duration_ms
                     stages["vad_hangover_used_ms"] = ingest.machine.last_hangover_used_ms
                     audio16k = ingest.take_final()
-                    await _finalize_turn(ws, session, audio16k, 16000, messages, robin_history, tid, stages)
+                    await _finalize_turn(ws, session, audio16k, 16000, history, tid, stages)
                     stages = None
     except WebSocketDisconnect:
         pass

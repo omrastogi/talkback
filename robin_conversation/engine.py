@@ -1,0 +1,188 @@
+"""Turn-level orchestration: intent routing + the delete-confirmation sentinel gate, tying
+llm.py/classifier.py/intent_handlers.py/prompt_context.py together. Ported from
+recover/services/conversation/{engine.py,flow.py} with the DB (Patient/Conversation/
+ConversationLog rows) replaced by a plain in-memory `history: list[dict]` you own and pass
+in on every call -- nothing here persists anything.
+
+Message dict shape: {"role": "user"|"assistant", "content": str,
+                      "chain_of_thoughts": str (optional), "require_affirmation": bool (opt),
+                      "reminder_active": bool (opt), "redacted": bool (opt),
+                      "speaker_display_name": str (opt)}.
+
+Reminders have no built-in implementation -- the original calls out to a separate
+microservice this package doesn't have. Pass your own:
+    reminder_handler(message: str, user_id: str, history: list[dict]) -> (reply: str, completed: bool)
+if you want "remind me to..." requests handled; completed=False keeps routing subsequent
+turns straight back to reminder_handler (an ongoing reminder dialog) until it returns True.
+Without one, reminder-classified messages just fall through to the normal conversational
+reply, same as any other unsupported capability.
+"""
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from .classifier import classify_conversation_intent, is_affirmation_intent
+from .intent_handlers import (
+    build_capabilities_message,
+    build_delete_message_confirmation,
+    build_end_conversation_message,
+    build_schedule_message,
+    build_weather_message,
+)
+from .llm import conversation as llm_conversation
+from .prompt_context import build_conversation_prompt_context
+
+REMINDER_CHAIN_MARKER = "REMINDER_AGENT"
+DELETE_CONFIRMATION_CHAIN_MARKER = "DELETE_CONFIRMATION_PENDING"
+
+ReminderHandler = Callable[[str, str, List[Dict[str, Any]]], Tuple[str, bool]]
+
+
+def _redact_last_two_before(history: List[Dict[str, Any]], prev_index: int) -> None:
+    """Ported from intent_handlers/affirmation.py::redact_last_two_before, operating on the
+    in-memory history list instead of ConversationLog rows."""
+    one_before = prev_index - 1
+    if one_before <= 0:
+        return
+    for message in history[max(0, one_before - 2):one_before]:
+        if not message.get("redacted"):
+            message["content"] = "REDACTED"
+            message["redacted"] = True
+
+
+def _resolve_active_reminder(
+    history: List[Dict[str, Any]], content: str, user_id: str, reminder_handler: Optional[ReminderHandler]
+) -> Optional[str]:
+    last_message = history[-1] if history else None
+    if not (
+        reminder_handler
+        and last_message
+        and last_message.get("chain_of_thoughts") == REMINDER_CHAIN_MARKER
+        and last_message.get("reminder_active")
+    ):
+        return None
+
+    history.append({"role": "user", "content": content})
+    reply, completed = reminder_handler(content, user_id, history)
+    history.append({
+        "role": "assistant",
+        "content": reply,
+        "chain_of_thoughts": REMINDER_CHAIN_MARKER,
+        "reminder_active": not completed,
+    })
+    return reply
+
+
+def _resolve_pending_followup(history: List[Dict[str, Any]], content: str, user_id: str) -> Optional[str]:
+    """Ported from services/conversation/flow.py::resolve_pending_followup -- only the
+    delete-confirmation gate, the sole one actually wired up in the original app."""
+    last_message = history[-1] if history else None
+    if not (
+        last_message
+        and last_message.get("require_affirmation")
+        and DELETE_CONFIRMATION_CHAIN_MARKER in (last_message.get("chain_of_thoughts") or "")
+    ):
+        return None
+
+    history.append({"role": "user", "content": content})
+    if is_affirmation_intent(content, user_id):
+        _redact_last_two_before(history, len(history) - 2)
+        reply = "I have deleted the last message. Is there anything else I can help you with?"
+    else:
+        reply = "Is there anything else I can help you with?"
+    history.append({"role": "assistant", "content": reply})
+    return reply
+
+
+def _run_default_conversation_flow(history: List[Dict[str, Any]], context: Dict[str, Any]) -> str:
+    llm_messages = [
+        {
+            "role": m["role"],
+            "content": (
+                f"[speaker: {m['speaker_display_name']}] {m['content']}"
+                if m["role"] == "user" and m.get("speaker_display_name")
+                else m["content"]
+            ),
+        }
+        for m in history
+    ]
+    reply = llm_conversation(llm_messages, "", context=context)
+    history.append({"role": "assistant", "content": reply})
+    return reply
+
+
+def process_turn(
+    history: List[Dict[str, Any]],
+    content: str,
+    *,
+    user_id: str = "user",
+    context: Optional[Dict[str, Any]] = None,
+    location_coordinates: Optional[Dict[str, float]] = None,
+    reminder_handler: Optional[ReminderHandler] = None,
+) -> Dict[str, Any]:
+    """Route one user turn. Mutates `history` in place (appends the user turn and the
+    assistant reply) and returns {"reply": str, "intent": str, "should_end_session": bool}.
+
+    `context` is passed straight to llm.conversation()/build_system_prompt(); if omitted,
+    it's auto-built via prompt_context.build_conversation_prompt_context(user_id) -- real
+    weather, a bundled dummy schedule/capabilities text, no profile/steps unless you wire
+    those up (see prompt_context.py).
+    """
+    if context is None:
+        context = build_conversation_prompt_context(user_id, location_coordinates=location_coordinates)
+
+    reminder_reply = _resolve_active_reminder(history, content, user_id, reminder_handler)
+    if reminder_reply is not None:
+        return {"reply": reminder_reply, "intent": "reminder", "should_end_session": False}
+
+    followup_reply = _resolve_pending_followup(history, content, user_id)
+    if followup_reply is not None:
+        return {"reply": followup_reply, "intent": "delete_message", "should_end_session": False}
+
+    intent = classify_conversation_intent(content, user_id)
+
+    if intent == "reminder" and reminder_handler is not None:
+        history.append({"role": "user", "content": content})
+        reply, completed = reminder_handler(content, user_id, history)
+        history.append({
+            "role": "assistant",
+            "content": reply,
+            "chain_of_thoughts": REMINDER_CHAIN_MARKER,
+            "reminder_active": not completed,
+        })
+        return {"reply": reply, "intent": intent, "should_end_session": False}
+
+    # Matches process_conversation_turn: the user's turn is logged once here, then routed
+    # (the reminder branch above logs its own turn instead, same as the original).
+    history.append({"role": "user", "content": content})
+
+    if intent == "delete_message":
+        reply = build_delete_message_confirmation()
+        history.append({
+            "role": "assistant",
+            "content": reply,
+            "chain_of_thoughts": DELETE_CONFIRMATION_CHAIN_MARKER,
+            "require_affirmation": True,
+        })
+        return {"reply": reply, "intent": intent, "should_end_session": False}
+
+    if intent == "capabilities_query":
+        reply = build_capabilities_message()
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": False}
+
+    if intent == "weather_query":
+        reply = build_weather_message(user_message=content, location_coordinates=location_coordinates)
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": False}
+
+    if intent == "schedule_query":
+        reply = build_schedule_message(user_message=content)
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": False}
+
+    if intent == "end_conversation":
+        reply = build_end_conversation_message()
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": True}
+
+    reply = _run_default_conversation_flow(history, context)
+    return {"reply": reply, "intent": intent, "should_end_session": False}

@@ -1,0 +1,131 @@
+{
+  "schemaVersion": "1.0",
+  "calendarMonth": "2026-01",
+  "comments": "Hardcoded dummy calendar for development/testing",
+  "metadata": {},
+  "weeks": [
+    {
+      "daysOfWeek": [
+        { "dayOfMonth": 1, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 2, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 3, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 4, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 5, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 6, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 7, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] }
+      ]
+    },
+    {
+      "daysOfWeek": [
+        { "dayOfMonth": 8, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 9, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 10, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 11, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 12, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 13, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 14, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] }
+      ]
+    },
+    {
+      "daysOfWeek": [
+        { "dayOfMonth": 15, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 16, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 17, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 18, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 19, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 20, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 21, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] }
+      ]
+    },
+    {
+      "daysOfWeek": [
+        { "dayOfMonth": 22, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 23, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 24, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 25, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 26, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 27, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 28, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] }
+      ]
+    },
+    {
+      "daysOfWeek": [
+        { "dayOfMonth": 29, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 30, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] },
+        { "dayOfMonth": 31, "events": [{ "sourceEventId": "evt-breakfast", "startTime": "08:00" }, { "sourceEventId": "evt-exercise", "startTime": "10:00" }, { "sourceEventId": "evt-walk", "startTime": "11:00" }, { "sourceEventId": "evt-lunch", "startTime": "12:00" }, { "sourceEventId": "evt-reading", "startTime": "15:00" }, { "sourceEventId": "evt-dinner-friends", "startTime": "17:30" }] }
+      ]
+    }
+  ],
+  "sourceEvents": [
+    {
+      "eventId": "evt-breakfast",
+      "name": "Breakfast",
+      "defaults": {
+        "startTime": "08:00",
+        "locationId": "loc-dining"
+      }
+    },
+    {
+      "eventId": "evt-exercise",
+      "name": "Morning Exercise",
+      "defaults": {
+        "startTime": "10:00",
+        "locationId": "loc-gym"
+      }
+    },
+    {
+      "eventId": "evt-walk",
+      "name": "Go on a Walk",
+      "defaults": {
+        "startTime": "11:00",
+        "locationId": "loc-outdoors"
+      }
+    },
+    {
+      "eventId": "evt-lunch",
+      "name": "Lunch",
+      "defaults": {
+        "startTime": "12:00",
+        "locationId": "loc-dining"
+      }
+    },
+    {
+      "eventId": "evt-reading",
+      "name": "Reading Time",
+      "defaults": {
+        "startTime": "15:00",
+        "locationId": "loc-library"
+      }
+    },
+    {
+      "eventId": "evt-dinner-friends",
+      "name": "Dinner with Friends",
+      "defaults": {
+        "startTime": "17:30",
+        "locationId": "loc-restaurant"
+      }
+    }
+  ],
+  "locations": [
+    {
+      "locationId": "loc-dining",
+      "name": "Dining Room"
+    },
+    {
+      "locationId": "loc-gym",
+      "name": "Fitness Center"
+    },
+    {
+      "locationId": "loc-library",
+      "name": "Library"
+    },
+    {
+      "locationId": "loc-outdoors",
+      "name": "Outdoors"
+    },
+    {
+      "locationId": "loc-restaurant",
+      "name": "Restaurant"
+    }
+  ]
+}
