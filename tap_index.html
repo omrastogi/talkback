@@ -35,8 +35,9 @@
 </head>
 <body>
 <header>
-  <h2>Tap-to-talk health voice demo</h2>
-  <p>Tap once (or <b>Space</b>) and speak — VAD ends your turn when you stop. Watch the meter.</p>
+  <h2>Robin Demo</h2>
+  <p>Tap once (or <b>Space</b>) and speak. The conversation then keeps going turn by turn —
+     stay quiet when it's your turn and it drops back to tap-to-talk.</p>
 </header>
 <div id="log"></div>
 <div id="vad">
@@ -73,8 +74,21 @@ function setVad(state, prob) {
 }
 function idle() { clientState = "IDLE"; talk.disabled = false; talk.textContent = "Tap to talk"; }
 
+// Re-arm listening for the next turn WITHOUT another tap — this is what keeps a
+// conversation going hands-free once it has been started by one tap. The server's
+// ARMED state (vad_arm_timeout_s, see vad/turn.py) auto-expires back to IDLE if you
+// stay quiet, and that ARM_TIMEOUT event is what sends the client back to idle()
+// (tap required again) — see the "arm_timeout" handler below.
+function rearm() {
+  clientState = "ARMED"; talk.disabled = true; talk.textContent = "listening…";
+  setStatus('listening — your turn'); setVad('ARMED', 0);
+  ws.send(JSON.stringify({ type: "turn_start" }));
+}
+
+let audioPromises = [];   // pending decode+schedule promises for the turn's reply chunks
+
 ws.onmessage = async (ev) => {
-  if (typeof ev.data !== "string") { setStatus('speaking'); return enqueueAudio(ev.data); }
+  if (typeof ev.data !== "string") { setStatus('speaking'); audioPromises.push(enqueueAudio(ev.data)); return; }
   const m = JSON.parse(ev.data);
   if (m.type === "vad_state") {
     setVad(m.state, m.prob);
@@ -86,7 +100,13 @@ ws.onmessage = async (ev) => {
     bots[bots.length - 1].textContent += m.text + ' ';
     log.scrollTop = log.scrollHeight; setStatus('speaking');
   } else if (m.type === "done") {
-    setStatus('your turn'); setVad('IDLE', 0); idle();
+    // Wait for every queued reply chunk to actually finish decoding/scheduling before
+    // reading nextStart, then wait for playback itself to finish before listening again
+    // — otherwise the mic re-arms mid-reply and can pick up the bot's own trailing audio.
+    await Promise.all(audioPromises); audioPromises = [];
+    const delayMs = playCtx ? Math.max(0, (nextStart - playCtx.currentTime) * 1000) : 0;
+    setStatus('your turn'); setVad('IDLE', 0);
+    setTimeout(rearm, delayMs);
   } else if (m.type === "arm_timeout") {
     setStatus('no speech — tap again'); setVad('IDLE', 0); idle();
   } else if (m.type === "vad_error") {
@@ -142,9 +162,7 @@ async function tap() {
   await openMic();
   // barge-in is out of scope: hard-stop any current playback so the reply doesn't talk over you
   if (playCtx) { try { await playCtx.close(); } catch (e) {} playCtx = null; nextStart = 0; }
-  clientState = "ARMED"; talk.disabled = true; talk.textContent = "listening…";
-  setStatus('listening'); setVad('ARMED', 0);
-  ws.send(JSON.stringify({ type: "turn_start" }));
+  rearm();
 }
 
 talk.addEventListener('click', tap);
