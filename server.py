@@ -14,6 +14,7 @@ import config   # importing sets PYTORCH_CUDA_ALLOC_CONF before torch loads (see
 import argparse
 import asyncio
 import dataclasses
+import functools
 import hmac
 import io
 import json
@@ -213,6 +214,18 @@ def _check_http_auth(request: Request) -> bool:
 # touched exclusively from the event loop (the blocking STT/TTS/LLM work runs in threads but
 # never mutates this dict directly), so no lock is needed. Capped so a long-running server
 # doesn't grow this unboundedly. ---
+# Latest clock_state frame per session (contract v2: the DEVICE owns timers/alarms and
+# pushes its whole state up after `start`, after every mutation, and when a timer fires or
+# stops ringing). We keep only the newest -- it is a full snapshot, not a delta -- and treat
+# it as the single source of truth for answering and for resolving cancels.
+SESSION_CLOCK = {}
+# One pending future per session, resolved by the inbound `cancel_result` frame. The device
+# is the only thing that knows whether a cancel actually applied, so Robin waits for its
+# verdict before speaking rather than confirming optimistically -- an unverified "cancelled
+# the tea timer" is the same class of lie as a phantom "timer set".
+SESSION_CANCEL_WAITER = {}
+CANCEL_RESULT_TIMEOUT_S = 2.0
+
 SESSIONS = {}
 MAX_SESSIONS_KEPT = 200
 
@@ -363,7 +376,9 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
     async with SESSION_LOCK[user_id]:
         await ws.send_json({"type": "turn_start", "turn_id": turn_id})
         t_llm = time.perf_counter()
-        result = await asyncio.to_thread(process_turn, history, transcript, user_id=user_id)
+        result = await asyncio.to_thread(
+            functools.partial(process_turn, history, transcript, user_id=user_id,
+                              clock_state=SESSION_CLOCK.get(user_id)))
         llm_dt = time.perf_counter() - t_llm
         reply = result["reply"]
         should_end = bool(result.get("should_end_session"))
@@ -371,9 +386,19 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
         # frames so the device starts the clock as Robin begins speaking. Inside the
         # lock for the same reason the rest of the turn is: send_greet must not
         # interleave between a frame and its spoken confirmation.
-        for action in result.get("client_actions") or []:
+        actions = result.get("client_actions") or []
+        awaits_cancel = bool(result.get("awaits_cancel_result")) and actions
+        if awaits_cancel:                       # arm BEFORE sending, or the reply can race us
+            SESSION_CANCEL_WAITER[user_id] = asyncio.get_running_loop().create_future()
+        for action in actions:
             await ws.send_json(action)
             log.info("turn %s  client_action %s", turn_id, action)
+        if awaits_cancel:
+            reply = await _await_cancel_result(user_id, result, turn_id)
+            # process_turn already logged the optimistic wording; correct it so a later turn
+            # reasons from what Robin actually said, not from what it hoped to say.
+            if history and history[-1].get("role") == "assistant":
+                history[-1]["content"] = reply
         reply_chunks, tts_total, idx, ttfs = [], 0.0, 0, None
         for sentence in _SENT_RE.split(reply.strip()):
             sentence = sentence.strip()
@@ -385,6 +410,32 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
             idx += 1
         await ws.send_json({"type": "done", "ending": should_end})
     return reply, reply_chunks, llm_dt, ttfs, tts_total, llm_dt, should_end
+
+
+async def _await_cancel_result(user_id, result, turn_id):
+    """Block briefly on the device's cancel_result and return the wording to actually speak.
+    A timeout is treated as failure, deliberately: if we never heard back we do not know the
+    cancel applied, and claiming it did is exactly the failure mode this handshake exists to
+    prevent."""
+    fut = SESSION_CANCEL_WAITER.get(user_id)
+    try:
+        res = await asyncio.wait_for(fut, CANCEL_RESULT_TIMEOUT_S)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        res = None
+    finally:
+        SESSION_CANCEL_WAITER.pop(user_id, None)
+
+    if res is None:
+        log.warning("turn %s  cancel_result timed out after %.1fs", turn_id, CANCEL_RESULT_TIMEOUT_S)
+        return result.get("reply_on_fail") or result["reply"]
+    log.info("turn %s  cancel_result %s", turn_id, res)
+    if not res.get("ok"):
+        return result.get("reply_on_fail") or result["reply"]
+    noun = result.get("cancel_all_noun")
+    if noun:                                     # all-cancel: the device owns the real count
+        from robin_conversation.clock import all_cancel_reply
+        return all_cancel_reply(res.get("count"), noun)
+    return result["reply"]
 
 
 GREET_TEXT = "How is your day going?"
@@ -496,6 +547,8 @@ async def ws_endpoint(ws: WebSocket):
         SESSION_WS.pop(session, None)
         SESSION_LOCK.pop(session, None)
         SESSION_HISTORY.pop(session, None)
+        SESSION_CLOCK.pop(session, None)
+        SESSION_CANCEL_WAITER.pop(session, None)
 
 
 PARTIAL_EVERY_S = 0.4   # seconds of new audio between live partial transcripts
@@ -512,6 +565,27 @@ def pcm16_to_wav16(samples, sr, path):
 @app.get("/stream")
 async def stream_index():
     return FileResponse(os.path.join(HERE, "stream_index.html"))
+
+
+def _spawn_turn(ws, session, audio16k, sr, history, tid, stages):
+    """Run one turn as its own task so the receive loop keeps reading.
+
+    This matters for more than tidiness: the turn AWAITS the device's cancel_result, and that
+    frame arrives on the very socket the loop reads. Running the turn inline meant the loop
+    was blocked on it, the frame was never read, and every cancel timed out into "I couldn't
+    cancel that" -- including successful ones. It also stops a mid-turn exception (a dead LLM
+    gateway, say) from escaping the endpoint and dropping the socket with no close frame."""
+    async def runner():
+        try:
+            await _finalize_turn(ws, session, audio16k, sr, history, tid, stages)
+        except Exception as e:                       # noqa: BLE001 -- must not kill the socket
+            log.error("turn %s failed: %r", tid, e)
+            try:                                     # never leave the client stuck on "thinking"
+                await ws.send_json({"type": "error", "text": "Sorry, something went wrong."})
+                await ws.send_json({"type": "done", "ending": False})
+            except Exception:                        # noqa: BLE001 -- socket already gone
+                pass
+    return asyncio.create_task(runner())
 
 
 async def _finalize_turn(ws, session, audio16k, sr, history, tid, stages):
@@ -578,6 +652,8 @@ async def ws_stream_endpoint(ws: WebSocket):
         SESSION_WS.pop(session, None)
         SESSION_LOCK.pop(session, None)
         SESSION_HISTORY.pop(session, None)
+        SESSION_CLOCK.pop(session, None)
+        SESSION_CANCEL_WAITER.pop(session, None)
         SESSION_GREET_PENDING.pop(session, None)
 
 
@@ -599,6 +675,16 @@ async def _run_hold(ws, session, history):
                     sr = int(data.get("sampleRate", 16000))
                     buf, n_samples, last_partial = [], 0, 0
                     t_turn_start = time.perf_counter()
+                elif typ == "cancel_result":
+                    waiter = SESSION_CANCEL_WAITER.get(session)
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(data)
+                elif typ == "clock_state":
+                    # Full snapshot from the device; replaces whatever we had.
+                    SESSION_CLOCK[session] = data
+                    log.info("clock_state session=%s timers=%d alarms=%d ringing=%s", session,
+                             len(data.get("timers") or []), len(data.get("alarms") or []),
+                             bool(data.get("ringing")))
                 elif typ == "end":
                     turn += 1
                     tid = f"{session}_t{turn:02d}"
@@ -607,7 +693,7 @@ async def _run_hold(ws, session, history):
                               "t_eou": time.perf_counter(),
                               "vad_speech_duration_ms": None, "vad_hangover_used_ms": None}
                     audio = np.concatenate(buf) if buf else None
-                    await _finalize_turn(ws, session, audio, sr, history, tid, stages)
+                    _spawn_turn(ws, session, audio, sr, history, tid, stages)
                     buf, n_samples, last_partial = [], 0, 0
             elif msg.get("bytes") is not None:
                 frame = np.frombuffer(msg["bytes"], dtype="<i2").astype("float32") / 32768.0
@@ -658,6 +744,16 @@ async def _run_tap(ws, session, history):
                 if typ == "start":
                     sr = int(data.get("sampleRate", 16000))
                     ingest = VadIngest(vad, params, sr)
+                elif typ == "cancel_result":
+                    waiter = SESSION_CANCEL_WAITER.get(session)
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(data)
+                elif typ == "clock_state":
+                    # Full snapshot from the device; replaces whatever we had.
+                    SESSION_CLOCK[session] = data
+                    log.info("clock_state session=%s timers=%d alarms=%d ringing=%s", session,
+                             len(data.get("timers") or []), len(data.get("alarms") or []),
+                             bool(data.get("ringing")))
                 elif typ == "turn_start":
                     if ingest is None:
                         ingest = VadIngest(vad, params, sr)
@@ -697,7 +793,7 @@ async def _run_tap(ws, session, history):
                     stages["vad_speech_duration_ms"] = ingest.machine.last_speech_duration_ms
                     stages["vad_hangover_used_ms"] = ingest.machine.last_hangover_used_ms
                     audio16k = ingest.take_final()
-                    await _finalize_turn(ws, session, audio16k, 16000, history, tid, stages)
+                    _spawn_turn(ws, session, audio16k, 16000, history, tid, stages)
                     stages = None
     except WebSocketDisconnect:
         pass

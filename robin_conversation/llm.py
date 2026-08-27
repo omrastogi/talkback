@@ -100,6 +100,8 @@ def build_system_prompt(*, context: Optional[Dict[str, Any]] = None, previous_re
         context_lines.append(f"Step count info: {context['steps_info']}")
     if "positive_quote_of_day" in context:
         context_lines.append(f"Positive quote of the day: {context['positive_quote_of_day']}")
+    if "clock_state" in context:
+        context_lines.append(f"Timers and alarms on the user's device: {context['clock_state']}")
     if "system_capabilities" in context:
         context_lines.append(f"System capabilities and boundaries: {context['system_capabilities']}")
 

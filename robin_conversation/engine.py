@@ -20,6 +20,13 @@ reply, same as any other unsupported capability.
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .classifier import classify_conversation_intent, is_affirmation_intent
+from .clock import (
+    build_clock_cancel_action,
+    build_clock_query_reply,
+    build_stop_ring_action,
+    format_clock_context,
+    ringing,
+)
 from .intent_handlers import (
     build_capabilities_message,
     build_show_action,
@@ -126,6 +133,7 @@ def process_turn(
     context: Optional[Dict[str, Any]] = None,
     location_coordinates: Optional[Dict[str, float]] = None,
     reminder_handler: Optional[ReminderHandler] = None,
+    clock_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Route one user turn. Mutates `history` in place (appends the user turn and the
     assistant reply) and returns {"reply": str, "intent": str, "should_end_session": bool},
@@ -140,6 +148,11 @@ def process_turn(
     """
     if context is None:
         context = build_conversation_prompt_context(user_id, location_coordinates=location_coordinates)
+    # The device owns the clock and pushes its whole state up; put it in the prompt so an
+    # ordinary conversational turn can refer to a running timer without a dedicated intent.
+    if clock_state is not None:
+        context = dict(context)
+        context["clock_state"] = format_clock_context(clock_state)
 
     reminder_reply = _resolve_active_reminder(history, content, user_id, reminder_handler)
     if reminder_reply is not None:
@@ -150,6 +163,11 @@ def process_turn(
         return {"reply": followup_reply, "intent": "delete_message", "should_end_session": False}
 
     intent = classify_conversation_intent(content, user_id)
+
+    # While something is actually ringing, a bare "stop"/"okay" is aimed at the noise. The
+    # classifier cannot know that -- only the device state does.
+    if ringing(clock_state) and intent in ("end_conversation", "conversation", "affirmation"):
+        intent = "stop_ring"
 
     # Robin asked for the missing duration/time on the previous turn -> treat this turn as the
     # answer, whatever the classifier made of it on its own.
@@ -184,6 +202,24 @@ def process_turn(
             "require_affirmation": True,
         })
         return {"reply": reply, "intent": intent, "should_end_session": False}
+
+    if intent == "stop_ring":
+        reply, client_actions = build_stop_ring_action(state=clock_state)
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": False,
+                "client_actions": client_actions}
+
+    if intent == "clock_cancel":
+        reply, client_actions, extra = build_clock_cancel_action(user_message=content, state=clock_state)
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": False,
+                "client_actions": client_actions, **extra}
+
+    if intent == "clock_query":
+        reply = build_clock_query_reply(user_message=content, state=clock_state)
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": False,
+                "client_actions": []}
 
     if intent in ("show_timers", "show_alarms"):
         reply, client_actions = build_show_action(intent=intent)

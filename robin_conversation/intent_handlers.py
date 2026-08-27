@@ -214,14 +214,19 @@ Rules:
   a silently-wrong timer is far worse than asking how long.
 - For an alarm with no am/pm stated, choose the interpretation a person most likely means
   (7 -> 07:00, "seven at night" -> 19:00).
-- Do not invent a label the user did not say. The words "timer" and "alarm" are NEVER a
-  label -- "set a timer for two minutes" has NO label, it is just a timer.
-- Return {{"items": []}} if the user asked for no timer or alarm at all.
-
-Also return "is_correction": true if the user is CORRECTING or REPLACING a timer/alarm that
-Robin just set ("no, make it thirty seconds", "actually five minutes", "I said seven"),
-rather than asking for an ADDITIONAL one ("another timer for five minutes", "also set one
-for seven"). Only true when Robin's previous line confirmed setting something. Default false.
+- "label" is what the item is FOR, in the user's own words. Take it from phrasings like
+  "a timer for the pasta" -> "pasta", "call it tea" -> "tea", "my gym alarm" -> "gym".
+- Never invent a label the user did not say, and never use the words "timer" or "alarm"
+  themselves as a label: "set a timer for two minutes" has NO label.
+- If the user gives a NAMING INSTRUCTION covering several items -- "name them A, B, C",
+  "name them alphabetically", "call them one, two, three" -- apply it across the items in
+  the order the user listed them. The instruction usually comes once, at the end, and
+  applies to EVERY item in the request. Speech recognition often mangles it ("name at name
+  it name them"); follow the intent anyway.
+  Example: "timers for 3, 7 and 8 minutes, name them alphabetically" ->
+    {{"items": [{{"kind":"timer","seconds":180,"label":"A"}},
+               {{"kind":"timer","seconds":420,"label":"B"}},
+               {{"kind":"timer","seconds":480,"label":"C"}}]}}
 """
 
 
@@ -282,10 +287,12 @@ def _extract_timer_args(user_message: str, previous: str = "") -> tuple:
 
 
 def _phrase(frame: Dict[str, Any]) -> str:
-    for_label = f" for {frame['label']}" if frame.get("label") else ""
+    label = frame.get("label")
     if frame["type"] == "set_timer":
-        return f"a timer for {_spoken_duration(frame['seconds'])}{for_label}"
-    return f"an alarm for {_spoken_clock_time(frame['hour'], frame['minutes'])}{for_label}"
+        dur = _spoken_duration(frame["seconds"])
+        return f"{label} for {dur}" if label else f"a timer for {dur}"
+    when = _spoken_clock_time(frame["hour"], frame["minutes"])
+    return f"{label} at {when}" if label else f"an alarm at {when}"
 
 
 def build_timer_action(*, user_message: str, intent: str = "set_timer",
@@ -344,8 +351,11 @@ def build_show_action(*, intent: str) -> tuple:
     outright -- verified on the Tab A9+), so a cancel frame would be a lie. Opening the Clock
     screen is the honest capability, and the reply says plainly that Robin cannot do it
     itself. Unlike set_*, this frame DOES take over the screen -- that is the point."""
+    # Lead with the ACTION, not the limitation. The old wording opened with "I can't...",
+    # which users heard as "this feature does not exist" even though the screen was opening
+    # in front of them. Still honest -- it never claims to have read or cancelled anything.
     if intent == "show_alarms":
-        return ("I can't read or change your alarms myself, but here's your alarm screen "
-                "— you can see and turn them off there."), [{"type": "show_alarms"}]
-    return ("I can't read or stop your timers myself, but here's your timer screen "
-            "— you can see and stop them there."), [{"type": "show_timers"}]
+        return ("Opening your alarm screen now — you can see and change your alarms there."
+                ), [{"type": "show_alarms"}]
+    return ("Opening your timer screen now — you can see and stop your timers there."
+            ), [{"type": "show_timers"}]

@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 
 INTENT_FLAGS_PATH = Path(__file__).with_name("intent_feature_flags.json")
 DEFAULT_PRECEDENCE = [
+    "stop_ring",
+    "clock_cancel",
+    "clock_query",
     "end_conversation",
     "show_timers",
     "show_alarms",
@@ -39,6 +42,53 @@ INTENT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"input": "no", "output": False},
             {"input": "i do not know", "output": False},
             {"input": "", "output": False},
+        ],
+    },
+    "stop_ring": {
+        "description": (
+            "User wants to silence a timer or alarm that is RINGING right now -- 'stop', "
+            "'turn it off', 'okay I heard it', 'silence'. Not for cancelling a timer that "
+            "is still counting down, and not for ending the conversation."
+        ),
+        "few_shots": [
+            {"input": "stop", "output": True},
+            {"input": "turn it off", "output": True},
+            {"input": "okay okay I heard it", "output": True},
+            {"input": "silence that", "output": True},
+            {"input": "cancel my tea timer", "output": False},
+            {"input": "goodbye", "output": False},
+        ],
+    },
+    "clock_cancel": {
+        "description": (
+            "User wants to CANCEL, delete, or remove a timer or alarm that already exists -- "
+            "possibly a specific one ('the tea timer', 'the 8:30 alarm') or all of them. "
+            "Creating one is set_timer/set_alarm; merely asking what exists is clock_query."
+        ),
+        "few_shots": [
+            {"input": "cancel the tea timer", "output": True},
+            {"input": "delete the 8:30 pm alarm", "output": True},
+            {"input": "remove all my timers", "output": True},
+            {"input": "turn off my morning alarm", "output": True},
+            {"input": "stop the pasta timer", "output": True},
+            {"input": "what timers do i have", "output": False},
+            {"input": "set a timer for five minutes", "output": False},
+        ],
+    },
+    "clock_query": {
+        "description": (
+            "User is ASKING about timers or alarms that already exist -- what they are, how "
+            "many, how much time is left, or when the next one is. Answering, not changing."
+        ),
+        "few_shots": [
+            {"input": "when is my next alarm", "output": True},
+            {"input": "how long is left on the pasta timer", "output": True},
+            {"input": "what timers do i have", "output": True},
+            {"input": "how many timers are running", "output": True},
+            {"input": "do i have any alarms set", "output": True},
+            {"input": "check my timers", "output": True},
+            {"input": "cancel the tea timer", "output": False},
+            {"input": "set a timer for five minutes", "output": False},
         ],
     },
     "show_timers": {
@@ -314,6 +364,10 @@ Rules:
 - Return a JSON object only.
 - Return one key named "intent".
 - The "intent" value must be one of: {", ".join([f'"{name}"' for name in enabled_intents])}, "none".
+- Return "stop_ring" when the user wants to silence something that is ringing right now.
+- Return "clock_cancel" when the user wants an EXISTING timer or alarm cancelled or deleted.
+- Return "clock_query" when the user is ASKING what timers/alarms exist, how many, how long is left, or when the next one is.
+- Return "show_timers" / "show_alarms" only when the user explicitly asks to SEE the clock screen itself.
 - Return "show_timers" / "show_alarms" when the user wants to see, check, list, change, stop or cancel a timer/alarm that ALREADY exists, rather than create a new one.
 - Return "set_timer" when the user asks to count down a relative duration (minutes/seconds/hours from now).
 - Return "set_alarm" when the user asks to be alerted at a specific clock time.
@@ -357,8 +411,8 @@ def classify_routing_intent(message: str, user_id: str) -> str:
     return classify_primary_intent(
         message,
         user_id,
-        ["conversation", "capabilities_query", "weather_query", "schedule_query", "show_timers", "show_alarms", "set_timer", "set_alarm", "reminder", "delete_message", "end_conversation"],
-        precedence=["end_conversation", "show_timers", "show_alarms", "set_timer", "set_alarm", "reminder", "delete_message", "weather_query", "schedule_query", "capabilities_query", "conversation"],
+        ["conversation", "capabilities_query", "weather_query", "schedule_query", "stop_ring", "clock_cancel", "clock_query", "show_timers", "show_alarms", "set_timer", "set_alarm", "reminder", "delete_message", "end_conversation"],
+        precedence=["stop_ring", "clock_cancel", "clock_query", "end_conversation", "show_timers", "show_alarms", "set_timer", "set_alarm", "reminder", "delete_message", "weather_query", "schedule_query", "capabilities_query", "conversation"],
     )
 
 
