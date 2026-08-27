@@ -350,6 +350,9 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
     fact. Returns (full_reply, reply_chunks, ttft, ttfs, tts_total, llm_dt, should_end_session)
     -- ttft equals llm_dt since there's no streaming first-token to distinguish it from.
 
+    process_turn's "client_actions" (set_timer / set_alarm / show_timers / show_alarms) are
+    forwarded verbatim as control frames; the device owns the countdown, not this server.
+
     `done`'s "ending" field carries process_turn's should_end_session verdict (the classifier's
     end_conversation intent -- "goodbye", "that's all for now", etc.) so the client knows not
     to auto-continue listening after this reply; the server only reports the signal, it never
@@ -364,6 +367,13 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
         llm_dt = time.perf_counter() - t_llm
         reply = result["reply"]
         should_end = bool(result.get("should_end_session"))
+        # Timer/alarm control frames, one per requested timer, sent before the reply
+        # frames so the device starts the clock as Robin begins speaking. Inside the
+        # lock for the same reason the rest of the turn is: send_greet must not
+        # interleave between a frame and its spoken confirmation.
+        for action in result.get("client_actions") or []:
+            await ws.send_json(action)
+            log.info("turn %s  client_action %s", turn_id, action)
         reply_chunks, tts_total, idx, ttfs = [], 0.0, 0, None
         for sentence in _SENT_RE.split(reply.strip()):
             sentence = sentence.strip()

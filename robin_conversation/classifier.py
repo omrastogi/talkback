@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 INTENT_FLAGS_PATH = Path(__file__).with_name("intent_feature_flags.json")
 DEFAULT_PRECEDENCE = [
     "end_conversation",
+    "show_timers",
+    "show_alarms",
+    "set_timer",
+    "set_alarm",
     "reminder",
     "delete_message",
     "weather_query",
@@ -35,6 +39,73 @@ INTENT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"input": "no", "output": False},
             {"input": "i do not know", "output": False},
             {"input": "", "output": False},
+        ],
+    },
+    "show_timers": {
+        "description": (
+            "User wants to see, check, list, count, change, stop, cancel, or delete a TIMER "
+            "(or all timers) that already exists -- including simply asking what timers are "
+            "running. Creating a new timer is set_timer, not this."
+        ),
+        "few_shots": [
+            {"input": "cancel my timer", "output": True},
+            {"input": "remove all timers", "output": True},
+            {"input": "stop the pasta timer", "output": True},
+            {"input": "what timers do i have", "output": True},
+            {"input": "show me my timers", "output": True},
+            {"input": "how long is left on my timer", "output": True},
+            {"input": "check my timers", "output": True},
+            {"input": "how many timers are running", "output": True},
+            {"input": "do i have any timers going", "output": True},
+            {"input": "set a timer for five minutes", "output": False},
+            {"input": "cancel my alarm", "output": False},
+        ],
+    },
+    "show_alarms": {
+        "description": (
+            "User wants to see, check, list, change, turn off, cancel, or delete an ALARM (or "
+            "all alarms) that already exists -- including simply asking what alarms are set. "
+            "Creating a new alarm is set_alarm, not this."
+        ),
+        "few_shots": [
+            {"input": "cancel my alarm", "output": True},
+            {"input": "turn off my morning alarm", "output": True},
+            {"input": "what alarms do i have set", "output": True},
+            {"input": "delete all my alarms", "output": True},
+            {"input": "check my alarms", "output": True},
+            {"input": "what time is my alarm set for", "output": True},
+            {"input": "set an alarm for 7 am", "output": False},
+            {"input": "cancel my timer", "output": False},
+        ],
+    },
+    "set_timer": {
+        "description": (
+            "User asks to start a countdown for a RELATIVE duration -- a timer for some "
+            "number of seconds, minutes, or hours from now. "
+            "A request tied to a clock time (\"at 7 am\") is set_alarm, not set_timer."
+        ),
+        "few_shots": [
+            {"input": "set a timer for two minutes", "output": True},
+            {"input": "timer for 10 minutes", "output": True},
+            {"input": "give me 30 seconds", "output": True},
+            {"input": "start a 5 minute timer for my tea", "output": True},
+            {"input": "can you time an hour for me", "output": True},
+            {"input": "wake me up at 7 am", "output": False},
+            {"input": "remind me to take my pills at 7 pm", "output": False},
+            {"input": "what time is it", "output": False},
+        ],
+    },
+    "set_alarm": {
+        "description": (
+            "User asks to be alerted at a specific CLOCK TIME (for example 7 am, 19:30, "
+            "half past six). A relative countdown is set_timer, not set_alarm."
+        ),
+        "few_shots": [
+            {"input": "set an alarm for 7 am", "output": True},
+            {"input": "wake me up at half past six", "output": True},
+            {"input": "alarm at 19:30 for the gym", "output": True},
+            {"input": "set a timer for five minutes", "output": False},
+            {"input": "what is on my calendar tomorrow", "output": False},
         ],
     },
     "reminder": {
@@ -243,6 +314,9 @@ Rules:
 - Return a JSON object only.
 - Return one key named "intent".
 - The "intent" value must be one of: {", ".join([f'"{name}"' for name in enabled_intents])}, "none".
+- Return "show_timers" / "show_alarms" when the user wants to see, check, list, change, stop or cancel a timer/alarm that ALREADY exists, rather than create a new one.
+- Return "set_timer" when the user asks to count down a relative duration (minutes/seconds/hours from now).
+- Return "set_alarm" when the user asks to be alerted at a specific clock time.
 - Only return "reminder" when the user is explicitly asking to create, set, change, or manage a reminder, or asking to view, list, or query their reminders, or asking to delete or remove a reminder.
 - Return "weather_query" when the user is explicitly asking about weather, forecast, rain, snow, sunshine, or temperature.
 - Return "schedule_query" when the user is explicitly asking about their calendar, schedule, agenda, plans, or activities.
@@ -283,8 +357,8 @@ def classify_routing_intent(message: str, user_id: str) -> str:
     return classify_primary_intent(
         message,
         user_id,
-        ["conversation", "capabilities_query", "weather_query", "schedule_query", "reminder", "delete_message", "end_conversation"],
-        precedence=["end_conversation", "reminder", "delete_message", "weather_query", "schedule_query", "capabilities_query", "conversation"],
+        ["conversation", "capabilities_query", "weather_query", "schedule_query", "show_timers", "show_alarms", "set_timer", "set_alarm", "reminder", "delete_message", "end_conversation"],
+        precedence=["end_conversation", "show_timers", "show_alarms", "set_timer", "set_alarm", "reminder", "delete_message", "weather_query", "schedule_query", "capabilities_query", "conversation"],
     )
 
 

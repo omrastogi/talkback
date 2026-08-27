@@ -22,6 +22,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .classifier import classify_conversation_intent, is_affirmation_intent
 from .intent_handlers import (
     build_capabilities_message,
+    build_show_action,
+    build_timer_action,
     build_delete_message_confirmation,
     build_end_conversation_message,
     build_schedule_message,
@@ -29,6 +31,13 @@ from .intent_handlers import (
 )
 from .llm import conversation as llm_conversation
 from .prompt_context import build_conversation_prompt_context
+
+# When Robin has just asked "how long?" / "what time?", the user's next turn is the ANSWER --
+# but the classifier only sees that turn's text, so a bare "thirty seconds" or "no, make it
+# five" lands in `conversation` and the request stalls. These markers let the engine route the
+# answer back to the timer flow, the same shape as the delete-confirmation gate below.
+TIMER_PENDING_MARKERS = ("how long would you like it for",)
+ALARM_PENDING_MARKERS = ("what time should i set it for",)
 
 REMINDER_CHAIN_MARKER = "REMINDER_AGENT"
 DELETE_CONFIRMATION_CHAIN_MARKER = "DELETE_CONFIRMATION_PENDING"
@@ -119,7 +128,10 @@ def process_turn(
     reminder_handler: Optional[ReminderHandler] = None,
 ) -> Dict[str, Any]:
     """Route one user turn. Mutates `history` in place (appends the user turn and the
-    assistant reply) and returns {"reply": str, "intent": str, "should_end_session": bool}.
+    assistant reply) and returns {"reply": str, "intent": str, "should_end_session": bool},
+    plus "client_actions": list[dict] on the timer/alarm intents -- a control frame the caller
+    is expected to forward to the device, which owns the actual countdown (see
+    intent_handlers.build_timer_action). Absent on every other intent.
 
     `context` is passed straight to llm.conversation()/build_system_prompt(); if omitted,
     it's auto-built via prompt_context.build_conversation_prompt_context(user_id) -- real
@@ -138,6 +150,15 @@ def process_turn(
         return {"reply": followup_reply, "intent": "delete_message", "should_end_session": False}
 
     intent = classify_conversation_intent(content, user_id)
+
+    # Robin asked for the missing duration/time on the previous turn -> treat this turn as the
+    # answer, whatever the classifier made of it on its own.
+    last_reply = (history[-1]["content"] if history and history[-1]["role"] == "assistant" else "").lower()
+    if intent not in ("show_timers", "show_alarms", "end_conversation"):
+        if any(marker in last_reply for marker in TIMER_PENDING_MARKERS):
+            intent = "set_timer"
+        elif any(marker in last_reply for marker in ALARM_PENDING_MARKERS):
+            intent = "set_alarm"
 
     if intent == "reminder" and reminder_handler is not None:
         history.append({"role": "user", "content": content})
@@ -163,6 +184,23 @@ def process_turn(
             "require_affirmation": True,
         })
         return {"reply": reply, "intent": intent, "should_end_session": False}
+
+    if intent in ("show_timers", "show_alarms"):
+        reply, client_actions = build_show_action(intent=intent)
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": False,
+                "client_actions": client_actions}
+
+    if intent in ("set_timer", "set_alarm"):
+        # history[-1] is the user turn just appended; [-2] is Robin's previous line, which is
+        # what makes "no, only thirty seconds" recognisable as a correction rather than a
+        # second timer.
+        previous_reply = history[-2]["content"] if len(history) >= 2 else ""
+        reply, client_actions = build_timer_action(user_message=content, intent=intent,
+                                                   previous_reply=previous_reply)
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": False,
+                "client_actions": client_actions}
 
     if intent == "capabilities_query":
         reply = build_capabilities_message()

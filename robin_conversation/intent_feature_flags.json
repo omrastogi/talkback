@@ -3,7 +3,11 @@
     "affirmation": true,
     "reminder": true,
     "delete_message": true,
-    "end_conversation": true
+    "end_conversation": true,
+    "set_timer": true,
+    "set_alarm": true,
+    "show_timers": true,
+    "show_alarms": true
   },
   "users": {
     "example-user-id-to-opt-out": {
