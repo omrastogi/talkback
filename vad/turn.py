@@ -77,8 +77,14 @@ class TurnMachine:
         self._trailing_frames = 0
 
     def arm(self) -> Event:
-        """Client 'turn_start': IDLE -> ARMED. No-op if a turn is already in flight."""
-        if self.state is State.IDLE:
+        """Client 'turn_start': IDLE -> ARMED, or ARMED -> freshly-ARMED. The no-speech clock
+        always restarts from *this* call -- vad_arm_timeout_s is "how long since we last told
+        the user it's their turn", not "how long since the first time we said so". Without
+        this, a second turn_start while still ARMED (e.g. two greets fired close together)
+        would inherit the first call's elapsed frames and could time out almost immediately.
+        No-op only once a turn is actually in flight (SPEECH/TRAILING) -- don't interrupt
+        in-progress speech capture."""
+        if self.state in (State.IDLE, State.ARMED):
             self.state = State.ARMED
             self._onset_count = 0
             self._armed_frames = 0
@@ -198,6 +204,16 @@ def _selftest():
     # 6) IDLE ignores speech: onset probability before arm() must not start a turn.
     m = TurnMachine(P())
     assert _drive(m, [0.9, 0.9, 0.9]) == [] and m.state is State.IDLE
+
+    # 7) re-arm while still ARMED restarts the no-speech clock from *this* call -- it must
+    # not inherit elapsed frames from the first arm() (e.g. two greets fired close together).
+    m = TurnMachine(P(vad_arm_timeout_s=0.1)); m.arm()             # 0.1s => 4 frames
+    assert _drive(m, [0.1, 0.1, 0.1]) == [], "should not time out yet (3/4 frames)"
+    m.arm()                                                        # re-arm resets the clock
+    assert _drive(m, [0.1, 0.1, 0.1]) == [], "re-arm inherited the first call's elapsed frames"
+    assert m.state is State.ARMED
+    assert _drive(m, [0.1]) == [Event.ARM_TIMEOUT]                 # full fresh window now spent
+    assert m.state is State.IDLE
 
     print("turn selftest OK")
 

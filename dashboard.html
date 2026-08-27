@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robin — session dashboard</title>
+<link rel="icon" href="data:,">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: #0b0b0b;
+         background: #f9f9f7; padding: 16px 20px 40px; }
+  header h2 { margin: 4px 0; }
+  header p { color: #52514e; margin: 0 0 18px; font-size: 14px; }
+
+  .tiles { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .tile { background: #fcfcfb; border: 1px solid rgba(11,11,11,0.10); border-radius: 12px;
+          padding: 12px 16px; min-width: 140px; flex: 1 1 140px; }
+  .tile .label { color: #52514e; font-size: 13px; margin: 0 0 4px; }
+  .tile .value { font-size: 28px; font-weight: 600; line-height: 1.1; }
+
+  .tablewrap { overflow-x: auto; border: 1px solid rgba(11,11,11,0.10); border-radius: 12px;
+               background: #fcfcfb; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; min-width: 920px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e1e0d9;
+           white-space: nowrap; }
+  th { color: #52514e; font-weight: 600; font-size: 12px; text-transform: uppercase;
+       letter-spacing: .04em; position: sticky; top: 0; background: #fcfcfb; }
+  td.id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  td.turns { font-variant-numeric: tabular-nums; text-align: right; }
+  td.transcript { white-space: normal; max-width: 360px; color: #52514e; }
+  tr:last-child td { border-bottom: none; }
+  tr.ended { color: #898781; }
+  tr.ended td.id { color: #52514e; }
+
+  .chip { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600;
+          padding: 3px 9px; border-radius: 8px; }
+  .chip .dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+  .chip.active { background: #dcfce7; color: #166534; }
+  .chip.active .dot { background: #16a34a; }
+  .chip.ended { background: #eee; color: #555; }
+  .chip.ended .dot { background: #9ca3af; }
+
+  .mode { display: inline-block; font-size: 12px; padding: 2px 7px; border-radius: 6px;
+          background: #eef2ff; color: #3730a3; }
+
+  .greet-btn { font-size: 12px; font-weight: 600; padding: 6px 12px; border: none;
+               border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer;
+               flex: 0 0 auto; }
+  .greet-btn:hover { background: #1d4ed8; }
+  .greet-btn:disabled { background: #cbd5e1; color: #eef2f7; cursor: default; }
+  .greet-btn.sent { background: #16a34a; }
+  .greet-btn.failed { background: #dc2626; }
+
+  .expand-btn { font-size: 12px; font-weight: 600; padding: 5px 10px; border: 1px solid #c3c2b7;
+                border-radius: 8px; background: #fff; color: #0b0b0b; cursor: pointer;
+                display: inline-flex; align-items: center; gap: 5px; }
+  .expand-btn:hover { background: #f4f4f2; }
+  .expand-btn .chevron { display: inline-block; transition: transform .15s ease; font-size: 10px; }
+  .expand-btn[aria-expanded="true"] .chevron { transform: rotate(180deg); }
+
+  tr.greet-panel-row td { background: #f7f8fb; border-bottom: 1px solid #e1e0d9; white-space: normal; }
+  .greet-panel { padding: 4px 2px; display: flex; gap: 8px; align-items: center; max-width: 560px; }
+  .greet-text { flex: 1 1 auto; font: inherit; font-size: 13px; padding: 8px 10px;
+                border: 1px solid #c3c2b7; border-radius: 8px; }
+
+  #empty { padding: 30px; text-align: center; color: #898781; }
+  #err { color: #b91c1c; font-size: 13px; margin: 0 0 10px; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<header>
+  <h2>Robin — live sessions</h2>
+  <p>Every WebSocket connection (classic push-to-talk, hold-to-talk, tap-to-talk) since this
+     server process started. Refreshes automatically.</p>
+</header>
+
+<div class="tiles">
+  <div class="tile"><div class="label">Active now</div><div class="value" id="t-active">—</div></div>
+  <div class="tile"><div class="label">Sessions today</div><div class="value" id="t-today">—</div></div>
+  <div class="tile"><div class="label">Turns today</div><div class="value" id="t-turns">—</div></div>
+</div>
+
+<div id="err"></div>
+
+<div class="tablewrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Session ID</th><th>Mode</th><th>Status</th><th>Client IP</th>
+        <th>Turns</th><th>Connected</th><th>Last activity</th><th>Last transcript</th><th>Action</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" hidden>No sessions yet — connect from the demo page.</div>
+</div>
+
+<script>
+const KEY_STORAGE = "robin_api_key";
+const rowsEl = document.getElementById('rows');
+const emptyEl = document.getElementById('empty');
+const errEl = document.getElementById('err');
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>]/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;' }[c]));
+}
+function relTime(ts, now) {
+  if (ts == null) return '—';
+  const s = Math.max(0, now - ts);
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return Math.floor(s / 86400) + 'd ago';
+}
+function isToday(ts) {
+  const d = new Date(ts * 1000), n = new Date();
+  return d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+}
+
+const COLS = 9;                          // total <th> count, for the expanded panel's colspan
+
+// Which sessions currently have their greet panel open, and what's typed into each one's
+// textbox. Both keyed by session id, both module state (not server data) so they survive
+// the 1.5s poll rebuilding the table underneath them.
+const DEFAULT_GREET_TEXT = 'Hi! How is your day going?';
+const expandedSessions = new Set();
+const greetDraft = {};
+
+function actionCellHtml(s) {
+  if (!(s.status === 'active' && s.mode === 'tap')) return '—';
+  const open = expandedSessions.has(s.id);
+  return `<button class="expand-btn" data-id="${escapeHtml(s.id)}" aria-expanded="${open}">
+            Greet <span class="chevron">▾</span>
+          </button>`;
+}
+
+function panelRowHtml(s) {
+  if (!expandedSessions.has(s.id)) return '';
+  // Pre-filled with the default so Send works immediately; only falls back once the admin
+  // hasn't touched the box yet (s.id absent) -- a deliberate clear-to-empty stays empty.
+  const text = s.id in greetDraft ? greetDraft[s.id] : DEFAULT_GREET_TEXT;
+  return `
+    <tr class="greet-panel-row">
+      <td colspan="${COLS}">
+        <div class="greet-panel" data-id="${escapeHtml(s.id)}">
+          <input class="greet-text" type="text" maxlength="500"
+                 placeholder="Type a message for Robin to say…" value="${escapeHtml(text)}">
+          <button class="greet-btn">Send</button>
+        </div>
+      </td>
+    </tr>`;
+}
+
+function render(data) {
+  const { now, sessions } = data;
+  const active = sessions.filter(s => s.status === 'active');
+  const today = sessions.filter(s => isToday(s.connected_at));
+  document.getElementById('t-active').textContent = active.length;
+  document.getElementById('t-today').textContent = today.length;
+  document.getElementById('t-turns').textContent = today.reduce((a, s) => a + s.turns, 0);
+
+  // Preserve focus + cursor position in an open textbox across the rebuild below --
+  // otherwise typing gets interrupted every 1.5s by the next poll.
+  const activeEl = document.activeElement;
+  let refocus = null;
+  if (activeEl && activeEl.classList.contains('greet-text') && rowsEl.contains(activeEl)) {
+    refocus = { id: activeEl.closest('.greet-panel').dataset.id,
+                selStart: activeEl.selectionStart, selEnd: activeEl.selectionEnd };
+  }
+
+  emptyEl.hidden = sessions.length > 0;
+  rowsEl.innerHTML = sessions.map(s => `
+    <tr class="${s.status}">
+      <td class="id">${escapeHtml(s.id)}</td>
+      <td><span class="mode">${escapeHtml(s.mode)}</span></td>
+      <td><span class="chip ${s.status}"><span class="dot"></span>${s.status}</span></td>
+      <td>${escapeHtml(s.ip)}</td>
+      <td class="turns">${s.turns}</td>
+      <td title="${new Date(s.connected_at * 1000).toLocaleString()}">${relTime(s.connected_at, now)}</td>
+      <td title="${new Date(s.last_activity * 1000).toLocaleString()}">${relTime(s.last_activity, now)}</td>
+      <td class="transcript">${s.last_transcript ? escapeHtml(s.last_transcript) : '—'}</td>
+      <td class="action-cell">${actionCellHtml(s)}</td>
+    </tr>${panelRowHtml(s)}`).join('');
+
+  if (refocus) {
+    const panel = rowsEl.querySelector(`.greet-panel[data-id="${CSS.escape(refocus.id)}"]`);
+    const el = panel && panel.querySelector('.greet-text');
+    if (el) { el.focus(); el.setSelectionRange(refocus.selStart, refocus.selEnd); }
+  }
+}
+
+// Requests must stay relative to this page's own path, not the domain root -- this app is
+// reverse-proxied behind a path prefix (e.g. /ai-caring/ca2/), and a leading-slash fetch
+// would resolve against the domain root instead, missing the proxy's location block entirely.
+const API_BASE = location.pathname.replace(/\/dashboard\/?$/, '');
+
+function authHeaders() {
+  const key = sessionStorage.getItem(KEY_STORAGE);
+  return key ? { 'X-Robin-Key': key } : {};
+}
+function askForKey(rejected) {
+  const k = prompt(rejected ? 'API key rejected — enter it again:' : 'Enter API key:');
+  if (k) sessionStorage.setItem(KEY_STORAGE, k);
+  else sessionStorage.removeItem(KEY_STORAGE);
+}
+
+let lastData = null;
+
+async function poll() {
+  const hadKey = !!sessionStorage.getItem(KEY_STORAGE);
+  let res;
+  try {
+    res = await fetch(API_BASE + '/api/sessions', { headers: authHeaders() });
+  } catch (e) {
+    errEl.textContent = 'Connection lost — retrying…';
+    return;
+  }
+  if (res.status === 401) {
+    sessionStorage.removeItem(KEY_STORAGE);
+    askForKey(hadKey);
+    return;                                    // next tick retries with the new key
+  }
+  errEl.textContent = '';
+  lastData = await res.json();
+  render(lastData);
+}
+
+rowsEl.addEventListener('click', (ev) => {
+  const toggle = ev.target.closest('.expand-btn');
+  if (!toggle) return;
+  const id = toggle.dataset.id;
+  if (expandedSessions.has(id)) expandedSessions.delete(id);
+  else expandedSessions.add(id);
+  if (lastData) render(lastData);              // reflect the toggle immediately, don't wait for the next poll
+});
+
+rowsEl.addEventListener('input', (ev) => {
+  const input = ev.target.closest('.greet-text');
+  if (!input) return;
+  greetDraft[input.closest('.greet-panel').dataset.id] = input.value;
+});
+
+rowsEl.addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('.greet-panel .greet-btn');
+  if (!btn) return;
+  const panel = btn.closest('.greet-panel');
+  const id = panel.dataset.id;
+  const input = panel.querySelector('.greet-text');
+  const text = input.value.trim() || DEFAULT_GREET_TEXT;   // Send always has something to say
+
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+  btn.classList.remove('sent', 'failed');
+  let res;
+  try {
+    res = await fetch(`${API_BASE}/api/sessions/${encodeURIComponent(id)}/greet`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+  } catch (e) {
+    btn.disabled = false; btn.textContent = 'Send';
+    errEl.textContent = 'Could not reach the server — try again.';
+    return;
+  }
+  if (res.status === 401) {
+    askForKey(true);
+    btn.disabled = false; btn.textContent = 'Send';
+    return;
+  }
+  if (res.ok) {
+    btn.classList.add('sent'); btn.textContent = 'Sent';
+    delete greetDraft[id];
+    input.value = '';
+  } else {
+    const body = await res.json().catch(() => ({}));
+    btn.disabled = false;
+    btn.classList.add('failed'); btn.textContent = body.error || 'Failed';
+  }
+  setTimeout(poll, 400);                        // pick up the [Robin, unprompted] transcript
+});
+
+poll();
+setInterval(() => { if (!document.hidden) poll(); }, 1500);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+</script>
+</body>
+</html>

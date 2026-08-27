@@ -13,6 +13,8 @@ import config   # importing sets PYTORCH_CUDA_ALLOC_CONF before torch loads (see
 
 import argparse
 import asyncio
+import dataclasses
+import hmac
 import io
 import json
 import logging
@@ -26,8 +28,8 @@ import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VOICE = "af_heart"
@@ -94,6 +96,11 @@ LLM_BASE_URL, LLM_API_KEY, MODEL = config.resolve_backend(ARGS.backend, ARGS.mod
 if not LLM_API_KEY:
     log.warning("no API key for backend '%s' — set %s in .env", ARGS.backend,
                 "OPENAI_API_KEY" if ARGS.backend == "openai" else "PARCS_API_KEY")
+
+# --- WebSocket shared-key auth: ROBIN_API_KEY. Unset -> auth disabled (local dev). ---
+API_KEY = config.api_key()
+if not API_KEY:
+    log.warning("ROBIN_API_KEY not set — WebSocket auth is DISABLED (fine for local dev only)")
 
 t = time.time(); stt_model = _load_stt(); STT_LOAD = time.time() - t
 from kokoro import KPipeline
@@ -174,6 +181,95 @@ def wav_bytes(audio):
 app = FastAPI()
 
 
+def _client_ip(ws: WebSocket) -> str:
+    """Requests arrive via nginx, so the real client address is in X-Real-IP, not
+    ws.client (that's the proxy)."""
+    return ws.headers.get("x-real-ip", "unknown")
+
+
+def _check_auth(ws: WebSocket) -> bool:
+    """True if this connection may proceed. Auth is disabled (returns True) when
+    ROBIN_API_KEY isn't set. The key travels as the Sec-WebSocket-Protocol header (set via
+    the WebSocket constructor's `protocols` argument), NOT a query string -- a query string
+    ends up verbatim in both nginx's and uvicorn's default access logs on every connection,
+    permanently persisting the shared secret in cleartext on disk. Headers aren't logged by
+    either's default access-log format, so this avoids that leak."""
+    if not API_KEY:
+        return True
+    supplied = ws.headers.get("sec-websocket-protocol", "")
+    return hmac.compare_digest(supplied, API_KEY)
+
+
+def _check_http_auth(request: Request) -> bool:
+    """Same gate as _check_auth, for the plain-HTTP dashboard API. The key travels as a
+    custom header (X-Robin-Key), never a query string, for the same log-leak reason as above."""
+    if not API_KEY:
+        return True
+    supplied = request.headers.get("x-robin-key", "")
+    return hmac.compare_digest(supplied, API_KEY)
+
+
+# --- Live session registry, for the /dashboard page. In-memory only (lost on restart) and
+# touched exclusively from the event loop (the blocking STT/TTS/LLM work runs in threads but
+# never mutates this dict directly), so no lock is needed. Capped so a long-running server
+# doesn't grow this unboundedly. ---
+SESSIONS = {}
+MAX_SESSIONS_KEPT = 200
+
+
+def _session_connect(session_id, mode, ip):
+    SESSIONS[session_id] = {
+        "id": session_id, "mode": mode, "ip": ip, "status": "active",
+        "connected_at": time.time(), "last_activity": time.time(), "ended_at": None,
+        "turns": 0, "last_transcript": "",
+    }
+    if len(SESSIONS) > MAX_SESSIONS_KEPT:
+        ended = sorted((sid for sid, s in SESSIONS.items() if s["status"] == "ended"),
+                        key=lambda sid: SESSIONS[sid]["ended_at"])
+        for sid in ended[:len(SESSIONS) - MAX_SESSIONS_KEPT]:
+            SESSIONS.pop(sid, None)
+
+
+def _session_turn(session_id, transcript):
+    s = SESSIONS.get(session_id)
+    if s is None:
+        return
+    s["turns"] += 1
+    s["last_activity"] = time.time()
+    s["last_transcript"] = transcript
+
+
+def _session_disconnect(session_id):
+    s = SESSIONS.get(session_id)
+    if s is None:
+        return
+    s["status"] = "ended"
+    s["ended_at"] = time.time()
+
+
+# --- Live handles for pushing an unprompted reply into a running session from the dashboard
+# (see send_greet below). Keyed by session id, populated at connect and dropped at disconnect
+# in each handler. SESSION_LOCK serializes every write to a session's socket -- a reply turn
+# and an admin-triggered greet must never interleave their send_json/send_bytes calls, since
+# both can be mid-flight from different asyncio tasks at once. ---
+SESSION_WS = {}
+SESSION_LOCK = {}
+SESSION_HISTORY = {}
+
+# Set by send_greet, consumed by the next turn_start in _run_tap: a user who was just spoken
+# to unprompted (rather than one who tapped the button themselves, already primed to speak)
+# needs a longer no-speech grace period before VAD gives up and re-idles.
+SESSION_GREET_PENDING = {}
+GREET_ARM_TIMEOUT_S = 20.0
+
+
+@app.get("/health")
+async def health():
+    # Unauthenticated by design, so monitoring can poll it without a key.
+    return {"status": "ok", "stt_loaded": stt_model is not None,
+            "tts_loaded": pipe is not None, "turn_mode": TURN_MODE}
+
+
 @app.get("/")
 async def index():
     # Default = tap-to-talk (VAD endpointing). Old hold demos stay at /stream and /classic.
@@ -184,6 +280,39 @@ async def index():
 @app.get("/classic")
 async def classic_index():
     return FileResponse(os.path.join(HERE, "index.html"))          # non-streaming push-to-talk (/ws)
+
+
+@app.get("/dashboard")
+async def dashboard_page():
+    return FileResponse(os.path.join(HERE, "dashboard.html"))
+
+
+@app.get("/api/sessions")
+async def api_sessions(request: Request):
+    if not _check_http_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    items = sorted(SESSIONS.values(), key=lambda s: s["connected_at"], reverse=True)
+    return {"now": time.time(), "sessions": items}
+
+
+@app.post("/api/sessions/{session_id}/greet")
+async def api_greet_session(session_id: str, request: Request):
+    """Dashboard button: make Robin speak a message (custom, or GREET_TEXT if none given)
+    unprompted into a live tap session, which re-arms VAD for free via the client's own
+    auto-continue (see send_greet). Only tap-mode sessions have a VAD arm state to re-enter,
+    so anything else is rejected."""
+    if not _check_http_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    s = SESSIONS.get(session_id)
+    if s is None or s["status"] != "active":
+        return JSONResponse({"error": "session is not active"}, status_code=404)
+    if s["mode"] != "tap":
+        return JSONResponse({"error": "greet is only supported for tap-mode sessions"}, status_code=400)
+    body = await request.json() if request.headers.get("content-length") not in (None, "0") else {}
+    text = (body.get("text") or "").strip()[:500] or GREET_TEXT
+    if not await send_greet(session_id, text):
+        return JSONResponse({"error": "session socket unavailable"}, status_code=409)
+    return {"status": "ok"}
 
 
 async def send_sentence(ws, sentence, reply_chunks, idx):
@@ -218,24 +347,66 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
     """Robin's reply: robin_conversation.process_turn() -> sentence TTS. Sends the same control
     messages (turn_start / reply / audio_meta / done) the client and playback telemetry expect;
     the LLM call is a blocking full reply (no token streaming), split into sentences after the
-    fact. Returns (full_reply, reply_chunks, ttft, ttfs, tts_total, llm_dt) -- ttft equals
-    llm_dt since there's no streaming first-token to distinguish it from."""
-    await ws.send_json({"type": "turn_start", "turn_id": turn_id})
-    t_llm = time.perf_counter()
-    result = await asyncio.to_thread(process_turn, history, transcript, user_id=user_id)
-    llm_dt = time.perf_counter() - t_llm
-    reply = result["reply"]
-    reply_chunks, tts_total, idx, ttfs = [], 0.0, 0, None
-    for sentence in _SENT_RE.split(reply.strip()):
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        if ttfs is None:
-            ttfs = time.perf_counter() - t_llm
-        tts_total += await send_sentence(ws, sentence, reply_chunks, idx)
-        idx += 1
-    await ws.send_json({"type": "done"})
-    return reply, reply_chunks, llm_dt, ttfs, tts_total, llm_dt
+    fact. Returns (full_reply, reply_chunks, ttft, ttfs, tts_total, llm_dt, should_end_session)
+    -- ttft equals llm_dt since there's no streaming first-token to distinguish it from.
+
+    `done`'s "ending" field carries process_turn's should_end_session verdict (the classifier's
+    end_conversation intent -- "goodbye", "that's all for now", etc.) so the client knows not
+    to auto-continue listening after this reply; the server only reports the signal, it never
+    closes anything itself.
+
+    Runs behind SESSION_LOCK[user_id]: send_greet (triggered from the dashboard) writes to the
+    same socket from a separate request, and the two must never interleave their frames."""
+    async with SESSION_LOCK[user_id]:
+        await ws.send_json({"type": "turn_start", "turn_id": turn_id})
+        t_llm = time.perf_counter()
+        result = await asyncio.to_thread(process_turn, history, transcript, user_id=user_id)
+        llm_dt = time.perf_counter() - t_llm
+        reply = result["reply"]
+        should_end = bool(result.get("should_end_session"))
+        reply_chunks, tts_total, idx, ttfs = [], 0.0, 0, None
+        for sentence in _SENT_RE.split(reply.strip()):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if ttfs is None:
+                ttfs = time.perf_counter() - t_llm
+            tts_total += await send_sentence(ws, sentence, reply_chunks, idx)
+            idx += 1
+        await ws.send_json({"type": "done", "ending": should_end})
+    return reply, reply_chunks, llm_dt, ttfs, tts_total, llm_dt, should_end
+
+
+GREET_TEXT = "How is your day going?"
+
+
+async def send_greet(session_id, text=GREET_TEXT):
+    """Speak `text` unprompted into an already-connected tap session, exactly as a normal
+    reply would (turn_start / reply / audio_meta / done) -- indistinguishable to the client
+    from a real turn. The client's own auto-continue (tap_index.html's rearm(), fired on
+    `done`) then re-sends {type: "turn_start"}, which is what actually arms VAD on the
+    server; nothing here has to poke the VAD state machine directly. Returns False if the
+    session has no live socket (already disconnected)."""
+    ws = SESSION_WS.get(session_id)
+    if ws is None:
+        return False
+    async with SESSION_LOCK[session_id]:
+        tid = f"{session_id}_greet{int(time.time())}"
+        await ws.send_json({"type": "turn_start", "turn_id": tid})
+        reply_chunks, idx = [], 0
+        for sentence in _SENT_RE.split(text.strip()):
+            sentence = sentence.strip()
+            if sentence:
+                await send_sentence(ws, sentence, reply_chunks, idx)
+                idx += 1
+        await ws.send_json({"type": "done", "ending": False})
+    SESSION_GREET_PENDING[session_id] = True                             # longer arm timeout
+    history = SESSION_HISTORY.get(session_id)                            # for the rearm this
+    if history is not None:                                              # triggers
+        history.append({"role": "assistant", "content": text})           # so the next real
+    _session_turn(session_id, f"[Robin, unprompted] {text}")             # LLM turn has context
+    log.info("greet  session=%s  %r", session_id, text)
+    return True
 
 
 def _append_telemetry(session, obj):
@@ -250,10 +421,23 @@ def _append_telemetry(session, obj):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    await ws.accept()
+    if not _check_auth(ws):
+        log.warning("rejected /ws connection from %s: bad or missing key", _client_ip(ws))
+        # Completing the handshake (accept) then immediately closing is what actually
+        # delivers code 1008 to the browser -- closing before accept fails the handshake
+        # itself (HTTP 403), which browsers surface as code 1006, not 1008. No GPU work
+        # happens either way: we return before ever reading a message.
+        await ws.accept()
+        await ws.close(code=1008)
+        return
+    await ws.accept(subprotocol=API_KEY)
     session = time.strftime("%Y%m%d_%H%M%S")
     log.info("ws connected  session=%s", session)
+    _session_connect(session, "classic", _client_ip(ws))
     history = []                                              # per-connection conversation memory
+    SESSION_WS[session] = ws
+    SESSION_LOCK[session] = asyncio.Lock()
+    SESSION_HISTORY[session] = history
     turn = 0
     try:
         while True:
@@ -282,18 +466,26 @@ async def ws_endpoint(ws: WebSocket):
             dur = sf.info(in_wav).duration
             log.info("turn %d  audio=%dB (%.2fs) -> %s", turn, len(audio_bytes), dur, in_wav)
             log.info("turn %d  stt %.2fs -> %r", turn, stt_dt, transcript)
+            _session_turn(session, transcript)
             await ws.send_json({"type": "transcript", "text": transcript})
 
-            full, reply_chunks, ttft, ttfs, tts_total, llm_dt = await robin_reply(ws, history, transcript, tid, session)
+            full, reply_chunks, ttft, ttfs, tts_total, llm_dt, ending = await robin_reply(
+                ws, history, transcript, tid, session)
 
             reply_wav = save_reply(reply_chunks, tid)
             turn_total = time.perf_counter() - t_turn
             log.info("turn %d  reply %r -> %s", turn, full.strip(), reply_wav)
             log.info("turn %d  timings: stt=%.2f ttft=%s ttfs=%s tts=%.2f llm=%.2f total=%.2f",
                      turn, stt_dt, _f(ttft), _f(ttfs), tts_total, llm_dt, turn_total)
+            if ending:
+                log.info("turn %d  user signaled end_conversation", turn)
     except WebSocketDisconnect:
         log.info("ws disconnected  session=%s turns=%d", session, turn)
-        return
+    finally:
+        _session_disconnect(session)
+        SESSION_WS.pop(session, None)
+        SESSION_LOCK.pop(session, None)
+        SESSION_HISTORY.pop(session, None)
 
 
 PARTIAL_EVERY_S = 0.4   # seconds of new audio between live partial transcripts
@@ -319,7 +511,7 @@ async def _finalize_turn(ws, session, audio16k, sr, history, tid, stages):
     TTS are called exactly as before — this only threads instrumentation through."""
     if audio16k is None or len(audio16k) == 0:                  # never silently drop: report empty
         await ws.send_json({"type": "transcript", "text": ""})
-        await ws.send_json({"type": "done"})
+        await ws.send_json({"type": "done", "ending": False})
         return
     in_wav = os.path.join(LOG_DIR, f"{tid}.in.wav")
     t = time.perf_counter()
@@ -331,12 +523,16 @@ async def _finalize_turn(ws, session, audio16k, sr, history, tid, stages):
     await ws.send_json({"type": "transcript", "text": transcript})
 
     t_reply = time.perf_counter()
-    full, reply_chunks, ttft, ttfs, tts_total, llm_dt = await robin_reply(ws, history, transcript, tid, session)
+    full, reply_chunks, ttft, ttfs, tts_total, llm_dt, ending = await robin_reply(
+        ws, history, transcript, tid, session)
     stages["t_llm_first_token"] = (t_reply + ttft) if ttft is not None else None
     stages["t_tts_first_frame"] = (t_reply + ttfs) if ttfs is not None else None
 
     reply_wav = save_reply(reply_chunks, tid)
     log.info("turn %s  reply (tts=%.2f llm=%.2f) %r -> %s", tid, tts_total, llm_dt, full.strip(), reply_wav)
+    if ending:
+        log.info("turn %s  user signaled end_conversation", tid)
+    _session_turn(session, transcript)
     rec = {"session": session, "tid": tid, "backend": ARGS.backend,
            "transcript": transcript, "reply": full.strip(), **stages}
     asyncio.create_task(asyncio.to_thread(_append_bench, f"vad_{session}", rec))
@@ -347,14 +543,32 @@ async def ws_stream_endpoint(ws: WebSocket):
     """Tap-to-talk (VAD endpointing) or hold-to-talk, per config.turn_mode(). Both reuse the
     resident models and the shared reply/finalize path; only turn-boundary detection differs.
     turn_mode='hold' is the latency-matrix control that isolates VAD hangover from the pipeline."""
-    await ws.accept()
+    if not _check_auth(ws):
+        log.warning("rejected /ws-stream connection from %s: bad or missing key", _client_ip(ws))
+        # See ws_endpoint's comment: accept-then-close is what actually delivers 1008 to
+        # the browser. No GPU work happens either way -- we return before reading a message.
+        await ws.accept()
+        await ws.close(code=1008)
+        return
+    await ws.accept(subprotocol=API_KEY)
     session = time.strftime("%Y%m%d_%H%M%S")
     log.info("ws-stream connected  session=%s  turn_mode=%s", session, TURN_MODE)
+    _session_connect(session, TURN_MODE, _client_ip(ws))
     history = []                                              # per-connection conversation memory
-    if TURN_MODE == "tap":
-        await _run_tap(ws, session, history)
-    else:
-        await _run_hold(ws, session, history)
+    SESSION_WS[session] = ws
+    SESSION_LOCK[session] = asyncio.Lock()
+    SESSION_HISTORY[session] = history
+    try:
+        if TURN_MODE == "tap":
+            await _run_tap(ws, session, history)
+        else:
+            await _run_hold(ws, session, history)
+    finally:
+        _session_disconnect(session)
+        SESSION_WS.pop(session, None)
+        SESSION_LOCK.pop(session, None)
+        SESSION_HISTORY.pop(session, None)
+        SESSION_GREET_PENDING.pop(session, None)
 
 
 async def _run_hold(ws, session, history):
@@ -416,6 +630,8 @@ async def _run_tap(ws, session, history):
     except Exception as e:                                      # model missing / ORT init failure
         log.warning("tap: SileroVAD init failed (%s) — degrading this connection to hold", e)
         await ws.send_json({"type": "vad_error", "text": "VAD unavailable, using hold"})
+        if session in SESSIONS:
+            SESSIONS[session]["mode"] = "hold-fallback"
         return await _run_hold(ws, session, history)
 
     ingest, sr = None, 16000
@@ -441,6 +657,12 @@ async def _run_tap(ws, session, history):
                               "t_turn_start": time.perf_counter(), "t_speech_onset": None,
                               "t_eou": None, "vad_speech_duration_ms": None,
                               "vad_hangover_used_ms": None}
+                    # A greet speaks before the user expects it, so give this one arm cycle
+                    # more grace than a self-initiated tap (which already has the user
+                    # primed to speak). Reverts to the connection's normal params right after
+                    # -- this only ever elevates the *next* arm, never the ones after it.
+                    ingest.machine.p = (dataclasses.replace(params, vad_arm_timeout_s=GREET_ARM_TIMEOUT_S)
+                                         if SESSION_GREET_PENDING.pop(session, False) else params)
                     ingest.arm()
                     await ws.send_json({"type": "vad_state", "state": "ARMED", "prob": 0.0})
                 continue

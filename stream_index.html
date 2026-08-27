@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Streaming push-to-talk voice demo</title>
+<link rel="icon" href="data:,">
 <style>
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -48,13 +49,40 @@ let playCtx = null, nextStart = 0;
 let capCtx = null, micStream = null, source = null, recNode = null, holding = false;
 
 const wsProto = location.protocol === "https:" ? "wss://" : "ws://";
-const ws = new WebSocket(wsProto + location.host + "/ws-stream");
-ws.binaryType = "arraybuffer";
+const wsBase = location.pathname.replace(/\/$/, "");
+
+// API key: never embedded in this page -- only ever comes from the user, cached in
+// sessionStorage for the tab's lifetime. Sent as a Sec-WebSocket-Protocol value (via the
+// WebSocket constructor's second argument) rather than a URL query param, since a query
+// param ends up verbatim in nginx's/uvicorn's access logs on every connection.
+const KEY_STORAGE = "robin_api_key";
+function getKey(promptMsg) {
+  let key = sessionStorage.getItem(KEY_STORAGE);
+  while (!key) {
+    key = prompt(promptMsg || "Enter API key:");
+    if (key) sessionStorage.setItem(KEY_STORAGE, key);
+  }
+  return key;
+}
+
+let ws;
+function connect(promptMsg) {
+  ws = new WebSocket(wsProto + location.host + wsBase + "/ws-stream", [getKey(promptMsg)]);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = handleMessage;
+  ws.onclose = (ev) => {
+    if (ev.code === 1008) {
+      sessionStorage.removeItem(KEY_STORAGE);
+      setStatus('key rejected — enter it again');
+      connect("API key rejected — enter it again:");
+    }
+  };
+}
 
 function setStatus(s) { statusEl.textContent = s; }
 function escapeHtml(s) { return s.replace(/[&<>]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;' }[c])); }
 
-ws.onmessage = async (ev) => {
+async function handleMessage(ev) {
   if (typeof ev.data === "string") {
     const m = JSON.parse(ev.data);
     if (m.type === "partial") {
@@ -76,7 +104,7 @@ ws.onmessage = async (ev) => {
     setStatus('speaking');
     await enqueueAudio(ev.data);
   }
-};
+}
 
 async function enqueueAudio(arrayBuffer) {
   if (!playCtx) { playCtx = new AudioContext(); nextStart = 0; }
@@ -150,6 +178,7 @@ talk.addEventListener('pointerup',   e => { e.preventDefault(); stopTalk(); });
 talk.addEventListener('pointerleave', () => stopTalk());
 window.addEventListener('keydown', e => { if (e.code === "Space" && !e.repeat) { e.preventDefault(); startTalk(); } });
 window.addEventListener('keyup',   e => { if (e.code === "Space") { e.preventDefault(); stopTalk(); } });
+connect();
 </script>
 </body>
 </html>

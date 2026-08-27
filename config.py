@@ -90,6 +90,13 @@ def turn_mode():
     return os.environ.get("TURN_MODE", TURN_MODE_DEFAULT)
 
 
+def api_key():
+    """Shared secret for WebSocket auth (ROBIN_API_KEY). None means auth is disabled --
+    the caller is responsible for warning about that, since only it knows if this is dev."""
+    load_env()
+    return os.environ.get("ROBIN_API_KEY") or None
+
+
 def vad_provider_override():
     load_env()
     return os.environ.get("VAD_PROVIDER_OVERRIDE", VAD_PROVIDER_OVERRIDE_DEFAULT)

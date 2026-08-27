@@ -207,3 +207,20 @@ source ~/miniconda3/etc/profile.d/conda.sh && conda activate voice && cd /mnt/e/
 
 python server.py --host 0.0.0.0 --port 8000
 ~/cloudflared tunnel --url http://localhost:8000
+
+
+source ~/miniconda3/etc/profile.d/conda.sh && conda activate voice 
+uvicorn server:app --host 0.0.0.0 --port 9000 --root-path /ai-caring/ca2 
+
+Tunnel 
+ssh -p 6540 -N -L 9000:localhost:9000 rastogio@gateway.parcs.northeastern.edu
+
+Example - Client: 
+python examples/client.py log/20260812_150850_t01.in.wav -o /tmp/reply.wav --url ws://localhost:9000/ws-stream
+
+tmux new -s robin
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate voice
+cd ~/talkback
+export ROBIN_API_KEY=<your-key>
+uvicorn server:app --host 0.0.0.0 --port 9000 --root-path /ai-caring/ca2
