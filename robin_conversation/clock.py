@@ -16,8 +16,15 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .intent_handlers import _spoken_clock_time, _spoken_duration
+from .intent_handlers import (_spoken_clock_time, _spoken_duration, normalize_days,
+                              spoken_days)
 from .llm import chat_model_id, inference as llm_inference
+
+
+# Day names / shorthands, used to decide whether the user actually asked to change the days.
+_DAY_WORDS = re.compile(r"\b(mon|tues|wednes|thurs|fri|satur|sun)day s?\b".replace(" ", "")
+                        + r"|\bweekdays?\b|\bweekends?\b|\bdaily\b|\bevery (?:day|week)\b",
+                        re.IGNORECASE)
 
 
 def _now_ms() -> int:
@@ -53,6 +60,8 @@ def describe_timer(t: Dict[str, Any], now_ms: Optional[int] = None) -> str:
 def describe_alarm(a: Dict[str, Any]) -> str:
     label = a.get("label")
     when = _spoken_clock_time(int(a.get("hour", 0)), int(a.get("minutes") or 0))
+    if a.get("days"):
+        when = f"{when} {spoken_days(a['days'])}"
     return f"the {label} alarm at {when}" if label else f"the alarm at {when}"
 
 
@@ -79,8 +88,10 @@ def format_clock_context(state) -> str:
         lines.append(f"- timer id={t.get('id')} label={t.get('label') or 'none'} "
                      f"remaining_seconds={remaining} total_seconds={t.get('seconds')}")
     for a in _alarms(state):
+        days = a.get("days")
         lines.append(f"- alarm id={a.get('id')} label={a.get('label') or 'none'} "
-                     f"time={int(a.get('hour', 0)):02d}:{int(a.get('minutes') or 0):02d}")
+                     f"time={int(a.get('hour', 0)):02d}:{int(a.get('minutes') or 0):02d} "
+                     f"repeats={spoken_days(days) if days else 'one-off'}")
     r = ringing(state)
     if r:
         lines.append(f"- RINGING NOW: {json.dumps(r)}")
@@ -105,6 +116,7 @@ User question: "{message}"
 
 Rules:
 - Answer ONLY from the state above. Never invent a timer or alarm that is not listed.
+- If an alarm repeats, say which days ("half past eight on Monday, Wednesday and Friday").
 - If the state lists none, say plainly that they have none set.
 - One or two short spoken sentences. Say times and durations naturally ("four minutes left",
   "half past eight"), never as raw numbers of seconds and never as an id.
@@ -184,7 +196,7 @@ def build_clock_cancel_action(*, user_message: str, state) -> Tuple[str, List[Di
     `reply` is only used when the device confirms ok."""
     if state is None:
         return ("I can't see your timers just now, so I don't want to cancel the wrong one. "
-                "Here's your timer screen."), [{"type": "show_timers"}], {}
+                "Give me a moment and try again."), [], {}
     if is_empty(state):
         return "You don't have any timers or alarms set right now.", [], {}
 
@@ -209,7 +221,9 @@ def build_clock_cancel_action(*, user_message: str, state) -> Tuple[str, List[Di
 
     if parsed.get("all"):
         if not items:
-            return f"You don't have any {noun}s set right now.", []
+            # 3-tuple: engine.py unpacks (reply, frames, extra) -- returning two crashed the
+            # turn with ValueError on "cancel all my alarms" when only timers existed.
+            return f"You don't have any {noun}s set right now.", [], {}
         return (all_cancel_reply(len(items), noun),      # provisional; the device's count wins
                 [{"type": frame_type, "match": {"all": True}}],
                 {"awaits_cancel_result": True,
@@ -240,3 +254,115 @@ def build_stop_ring_action(*, state) -> Tuple[str, List[Dict[str, Any]]]:
     if state is not None and not ringing(state):
         return "Nothing is ringing at the moment.", []
     return "Stopped.", [{"type": "stop_ring"}]
+
+
+_MODIFY_PROMPT = """The user wants to CHANGE an existing timer or alarm, not delete it.
+
+{context}
+
+User message: "{message}"
+
+Return a JSON object only:
+- "kind": "timer" or "alarm".
+- "id": the id of the item being changed, copied EXACTLY from the state above, or null if
+  nothing matches.
+- "hour" / "minutes": the alarm's time AFTER the change (unchanged values if they did not
+  mention the time).
+- "days": the FULL list of days the alarm should fire on after the change, lowercase 3-letter
+  names. Apply the edit to the existing list: dropping Monday from ["mon","tue","fri"] gives
+  ["tue","fri"]; adding Sunday to ["mon"] gives ["mon","sun"]. Omit for a one-off alarm.
+- "seconds": for a timer, the new total duration in seconds.
+- "label": the label after the change, or null.
+
+Rules:
+- Only ever return an id that appears verbatim in the state above.
+- Carry over every field the user did NOT mention; only change what they asked to change.
+- If several items match equally, return "id": null.
+"""
+
+
+def build_clock_modify_action(*, user_message: str, state) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+    """(spoken reply, frames, extra) for an edit.
+
+    There is no edit frame in the contract, so an edit is cancel-then-recreate. The recreate
+    is deliberately deferred until the device confirms the cancel actually applied (see
+    `actions_after_ok`): sending both at once would leave the user with TWO alarms whenever
+    the cancel failed, which is worse than the edit not happening.
+    """
+    if state is None or is_empty(state):
+        return "You don't have any timers or alarms set right now.", [], {}
+
+    raw = llm_inference(
+        [{"role": "user", "content": _MODIFY_PROMPT.format(
+            context=format_clock_context(state), message=user_message)}],
+        model=chat_model_id(), response_format={"type": "json_object"},
+        operation_name="clock_modify_resolve")
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    kind = parsed.get("kind")
+    items = _alarms(state) if kind == "alarm" else _timers(state)
+    match = next((i for i in items if str(i.get("id")) == str(parsed.get("id"))), None)
+    if match is None:
+        described = _join([describe_timer(t) for t in _timers(state)]
+                          + [describe_alarm(a) for a in _alarms(state)])
+        return (f"I'm not sure which one you mean. Right now you have {described}. "
+                "Which should I change?"), [], {}
+
+    label = parsed.get("label")
+    label = label.strip() if isinstance(label, str) and label.strip() else None
+    if kind == "alarm":
+        # dict.get(k, default) returns None when the key EXISTS and is null, which the model
+        # emits for fields the user did not mention -- so fall back explicitly.
+        raw_hour = parsed.get("hour")
+        raw_min = parsed.get("minutes")
+        try:
+            hour = int(raw_hour if raw_hour is not None else match.get("hour"))
+            if raw_min is not None:
+                minutes = int(raw_min or 0)
+            elif raw_hour is not None and int(raw_hour) != int(match.get("hour") or -1):
+                minutes = 0          # "move it to 9" means 9 o'clock, not 9:30
+            else:
+                minutes = int(match.get("minutes") or 0)
+        except (TypeError, ValueError):
+            return "I didn't catch the new time — what should it be?", [], {}
+        if not (0 <= hour <= 23 and 0 <= minutes <= 59):
+            return "I didn't catch the new time — what should it be?", [], {}
+        # If the user said nothing about days, the existing ones must survive verbatim.
+        # The model dropped a day on "move my 8:30 alarm to 9" -- silently un-setting a
+        # wake-up the user never mentioned is exactly the failure this feature must not have.
+        if _DAY_WORDS.search(user_message or ""):
+            days = normalize_days(parsed.get("days"))
+        else:
+            days = normalize_days(match.get("days"))
+        new = {"type": "set_alarm", "hour": hour, "minutes": minutes}
+        if days:
+            new["days"] = days
+        if label:
+            new["label"] = label
+        described_new = f"{_spoken_clock_time(hour, minutes)}" + (f" {spoken_days(days)}" if days else "")
+        cancel = {"type": "cancel_alarm", "match": {"id": match.get("id")}}
+        noun = "alarm"
+    else:
+        raw_secs = parsed.get("seconds")
+        try:
+            seconds = int(raw_secs if raw_secs is not None else match.get("seconds"))
+        except (TypeError, ValueError):
+            return "How long should that timer be now?", [], {}
+        if not 0 < seconds <= 24 * 3600:
+            return "How long should that timer be now?", [], {}
+        new = {"type": "set_timer", "seconds": seconds}
+        if label:
+            new["label"] = label
+        described_new = _spoken_duration(seconds)
+        cancel = {"type": "cancel_timer", "match": {"id": match.get("id")}}
+        noun = "timer"
+
+    return (f"Changed the {noun} to {described_new}.", [cancel],
+            {"awaits_cancel_result": True,
+             "actions_after_ok": [new],
+             "reply_on_fail": f"I couldn't change that {noun} — it may have already gone off."})

@@ -6,11 +6,10 @@
     "end_conversation": true,
     "set_timer": true,
     "set_alarm": true,
-    "show_timers": true,
-    "show_alarms": true,
     "stop_ring": true,
     "clock_cancel": true,
-    "clock_query": true
+    "clock_query": true,
+    "clock_modify": true
   },
   "users": {
     "example-user-id-to-opt-out": {

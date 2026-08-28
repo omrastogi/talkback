@@ -163,10 +163,73 @@ Rules:
 #   {"type": "set_timer", "seconds": <positive int>, "label": <str, optional>}
 #   {"type": "set_alarm", "hour": <0-23>, "minutes": <0-59>, "label": <str, optional>}
 
+# Repeating alarms. The client is strict on purpose: a present-but-invalid days list rejects
+# the whole frame, because a repeating alarm silently downgraded to a one-off is a missed
+# wake-up. So we normalise here and refuse to send anything we could not fully resolve.
+DAY_ORDER = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+DAY_FULL = {"sun": "Sunday", "mon": "Monday", "tue": "Tuesday", "wed": "Wednesday",
+            "thu": "Thursday", "fri": "Friday", "sat": "Saturday"}
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri")
+_WEEKEND = ("sat", "sun")
+_DAY_ALIASES = {}
+for _abbr, _full in DAY_FULL.items():
+    _DAY_ALIASES[_abbr] = _abbr
+    _DAY_ALIASES[_full.lower()] = _abbr
+    _DAY_ALIASES[_full.lower() + "s"] = _abbr          # "mondays"
+
+
+def normalize_days(raw):
+    """Any day list -> canonical week-ordered abbreviations, or None if ANY entry is
+    unrecognised. None means 'do not send a days field' -- never a silent partial list."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    out = set()
+    for item in raw:
+        if not isinstance(item, str):
+            return None
+        key = item.strip().lower()
+        if key in ("weekday", "weekdays"):
+            out.update(_WEEKDAYS)
+        elif key in ("weekend", "weekends"):
+            out.update(_WEEKEND)
+        elif key in ("daily", "everyday", "every day", "all"):
+            out.update(DAY_ORDER)
+        elif key in _DAY_ALIASES:
+            out.add(_DAY_ALIASES[key])
+        else:
+            return None                                # unrecognised -> refuse the whole list
+    return [d for d in DAY_ORDER if d in out] or None
+
+
+def spoken_days(days):
+    """['mon','wed','fri'] -> 'Monday, Wednesday and Friday'. Shorthands read naturally."""
+    if not days:
+        return ""
+    dset = set(days)
+    if dset == set(DAY_ORDER):
+        return "every day"
+    if dset == set(_WEEKDAYS):
+        return "every weekday"
+    if dset == set(_WEEKEND):
+        return "weekends"
+    names = [DAY_FULL[d] for d in DAY_ORDER if d in dset]
+    if len(names) == 1:
+        return f"every {names[0]}"
+    return ", ".join(names[:-1]) + f" and {names[-1]}"
+
+
 MAX_TIMER_SECONDS = 24 * 3600      # a day; anything longer is a misparse, not a request
 # Labels the model likes to echo back from the request itself. They are not what the timer is
 # FOR, and reading them aloud gives "Timer set for two minutes for timer."
-_GENERIC_LABELS = {"timer", "alarm", "timers", "alarms", "countdown", "reminder"}
+_GENERIC_LABELS = {"timer", "alarm", "timers", "alarms", "countdown", "reminder",
+                   # recurrence words the model likes to mistake for a purpose
+                   "weekday", "weekdays", "weekend", "weekends", "daily", "weekly",
+                   "every day", "every week", "monday", "tuesday", "wednesday",
+                   "thursday", "friday", "saturday", "sunday"}
 # Phrases our own confirmations use -- the only evidence that something is actually running.
 _SET_CONFIRMED_MARKERS = ("timer set", "alarm set", "i've set")
 
@@ -195,8 +258,15 @@ def _spoken_clock_time(hour: int, minutes: int) -> str:
 
 _TIMER_EXTRACTION_PROMPT = """Extract EVERY timer and alarm the user asked for in this message.
 
+The user's earlier request in this same exchange (may be empty): "{prior}"
 What Robin said immediately before (may be empty): "{previous}"
 User message: "{message}"
+
+If the earlier request is present, Robin asked for ONE missing detail and the user message is
+the answer. Combine them into a single item: the earlier request supplies everything except
+the detail just given (days, label, which kind), the user message supplies that detail.
+"Alarm for Monday, Tuesday and Wednesday" + "at eight thirty" is ONE alarm at 08:30 with
+days ["mon","tue","wed"] -- never a one-off that drops the days.
 
 Return a JSON object only, with one key "items": a list. One entry per timer or alarm the
 user asked for -- a single request yields a list of one; "3 minutes and another for 7" yields
@@ -205,6 +275,12 @@ two. Each entry has:
 - "seconds": total seconds as an integer (timer only).
 - "hour": hour in 24-hour form, 0-23, and "minutes": 0-59 (alarm only).
 - "label": what it is for, a short lowercase noun phrase, or null if not stated.
+- "days": for a REPEATING alarm, the days it should fire, as lowercase 3-letter names from
+  sun, mon, tue, wed, thu, fri, sat. Omit entirely for a one-off.
+  Resolve shorthands yourself: "every weekday" -> ["mon","tue","wed","thu","fri"];
+  "weekends" -> ["sat","sun"]; "every day"/"daily" -> all seven;
+  "Monday, Wednesday and Friday" -> ["mon","wed","fri"]; "every Tuesday" -> ["tue"].
+- "recurrence_requested": true if the user asked for it to repeat at all; omit otherwise.
 
 Rules:
 - Resolve spoken numbers ("two minutes" -> 120, "half an hour" -> 1800).
@@ -218,6 +294,9 @@ Rules:
   "a timer for the pasta" -> "pasta", "call it tea" -> "tea", "my gym alarm" -> "gym".
 - Never invent a label the user did not say, and never use the words "timer" or "alarm"
   themselves as a label: "set a timer for two minutes" has NO label.
+- Recurrence words are NEVER labels. "every weekday", "on Mondays", "daily", "every week"
+  describe WHEN it repeats, not what it is for -- set recurrence_requested instead and leave
+  label null.
 - If the user gives a NAMING INSTRUCTION covering several items -- "name them A, B, C",
   "name them alphabetically", "call them one, two, three" -- apply it across the items in
   the order the user listed them. The instruction usually comes once, at the end, and
@@ -256,6 +335,14 @@ def _validate_item(item: Any) -> Optional[Dict[str, Any]]:
         if not (0 <= hour <= 23 and 0 <= minutes <= 59):
             return None
         frame = {"type": "set_alarm", "hour": hour, "minutes": minutes}
+        days = normalize_days(item.get("days"))
+        if days:
+            frame["days"] = days
+        elif item.get("days") or item.get("recurrence_requested"):
+            # They asked for a repeat but we could not resolve the days. Sending a one-off
+            # would be a missed wake-up dressed up as success, so refuse the item and let
+            # build_timer_action ask which days.
+            return None
     else:
         return None
 
@@ -264,11 +351,11 @@ def _validate_item(item: Any) -> Optional[Dict[str, Any]]:
     return frame
 
 
-def _extract_timer_args(user_message: str, previous: str = "") -> tuple:
-    """One LLM call -> (list of validated client frames, is_correction)."""
+def _extract_timer_args(user_message: str, previous: str = "", prior: str = "") -> tuple:
+    """One LLM call -> (frames, is_correction, recurrence_requested, missing_piece)."""
     raw = llm_inference(
         [{"role": "user", "content": _TIMER_EXTRACTION_PROMPT.format(
-            message=user_message, previous=previous)}],
+            message=user_message, previous=previous, prior=prior)}],
         model=chat_model_id(),
         response_format={"type": "json_object"},
         operation_name="timer_extraction",
@@ -276,14 +363,39 @@ def _extract_timer_args(user_message: str, previous: str = "") -> tuple:
     try:
         parsed = json.loads(raw)
     except (TypeError, ValueError):
-        return [], False
+        return [], False, False, None
     if not isinstance(parsed, dict):
-        return [], False
-    items = parsed.get("items")
+        return [], False, False, None
+    items_raw = parsed.get("items")
+    items = items_raw
+    # The model puts this flag at the top level OR on the item, depending on the phrasing;
+    # accept either rather than depending on it choosing one.
+    recurrence = bool(parsed.get("recurrence_requested")) or any(
+        isinstance(i, dict) and i.get("recurrence_requested")
+        for i in (items if isinstance(items, list) else []))
     if not isinstance(items, list):
-        return [], bool(parsed.get("is_correction"))
-    return ([f for f in (_validate_item(i) for i in items) if f],
-            bool(parsed.get("is_correction")))
+        return [], bool(parsed.get("is_correction")), recurrence, None
+    frames = [f for f in (_validate_item(i) for i in items) if f]
+    # Identical frames in one turn are never intentional -- they are the model splitting a
+    # single repeating request into one item per day. Collapse them.
+    deduped, seen = [], set()
+    for f in frames:
+        key = json.dumps(f, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(f)
+    missing = None
+    if not deduped and isinstance(items_raw, list) and items_raw:
+        first = items_raw[0] if isinstance(items_raw[0], dict) else {}
+        if first.get("kind") == "alarm":
+            has_time = first.get("hour") is not None
+            has_days = normalize_days(first.get("days")) is not None
+            # Days given but no clock time -> asking "which days?" (as it used to) ignores
+            # what the user just said. Ask for the missing half.
+            missing = "time" if not has_time else ("days" if not has_days else None)
+        else:
+            missing = "duration"
+    return deduped, bool(parsed.get("is_correction")), recurrence, missing
 
 
 def _phrase(frame: Dict[str, Any]) -> str:
@@ -292,11 +404,13 @@ def _phrase(frame: Dict[str, Any]) -> str:
         dur = _spoken_duration(frame["seconds"])
         return f"{label} for {dur}" if label else f"a timer for {dur}"
     when = _spoken_clock_time(frame["hour"], frame["minutes"])
+    if frame.get("days"):
+        when = f"{when} {spoken_days(frame['days'])}"
     return f"{label} at {when}" if label else f"an alarm at {when}"
 
 
 def build_timer_action(*, user_message: str, intent: str = "set_timer",
-                       previous_reply: str = "") -> tuple:
+                       previous_reply: str = "", prior_request: str = "") -> tuple:
     """(spoken reply, list of client frames). One frame PER requested timer/alarm -- the
     device handles concurrent timers, so "3 minutes and another for 7" must not silently
     drop the second one.
@@ -305,7 +419,12 @@ def build_timer_action(*, user_message: str, intent: str = "set_timer",
     eggs"). That answer AFFIRMS the capability and asks for the missing piece rather than
     guessing: the old wording sounded like Robin had misheard, and a guessed duration is the
     worst failure this feature has."""
-    frames, is_correction = _extract_timer_args(user_message, previous_reply)
+    frames, is_correction, recurrence, missing = _extract_timer_args(
+        user_message, previous_reply, prior_request)
+    if not frames and missing == "time":
+        return "What time should that alarm go off?", []
+    if not frames and missing == "days":
+        return "Which days should that alarm go off on?", []
     # Only a reply that actually CONFIRMED setting something can be corrected. Without this,
     # a clarifying question ("how long would you like it for?") followed by "no, thirty
     # seconds" was read as a correction and claimed an earlier timer that never existed.
@@ -314,17 +433,17 @@ def build_timer_action(*, user_message: str, intent: str = "set_timer",
         is_correction = False
 
     if is_correction:
-        # A running timer cannot be cancelled (see build_show_action). Setting the corrected
-        # one and staying silent would leave the WRONG timer running too -- which is what
-        # happened live: "no, only thirty seconds" produced 90s AND 30s. So set the new one
-        # if we got it, then say plainly the old one is still running and open the screen.
+        # Setting the corrected one and staying silent leaves the WRONG timer running too --
+        # live, "no, only thirty seconds" produced 90s AND 30s. Cancelling is now possible
+        # (the device owns the clock), but this turn does not know the old timer's id, so
+        # say it is still there and invite the cancel, which is one short sentence away.
         if frames:
             phrases = [_phrase(f) for f in frames]
             joined = ", ".join(phrases[:-1]) + f", and {phrases[-1]}" if len(phrases) > 1 else phrases[0]
-            return (f"I've set {joined}, but I can't cancel the earlier one — "
-                    "here's your timer screen so you can remove it."), frames + [{"type": "show_timers"}]
-        return ("I can't change a timer once it's running — here's your timer screen "
-                "so you can remove it and we'll set a new one."), [{"type": "show_timers"}]
+            return (f"I've set {joined}. The earlier one is still running — "
+                    "say cancel it and I will."), frames
+        return ("Tell me the new time and I'll set it — the earlier one is still running, "
+                "so say cancel it if you want it gone."), []
 
     if not frames:
         if intent == "set_alarm":
@@ -336,26 +455,10 @@ def build_timer_action(*, user_message: str, intent: str = "set_timer",
         for_label = f" for {frame['label']}" if frame.get("label") else ""
         if frame["type"] == "set_timer":
             return f"Timer set for {_spoken_duration(frame['seconds'])}{for_label}.", frames
-        return f"Alarm set for {_spoken_clock_time(frame['hour'], frame['minutes'])}{for_label}.", frames
+        when = _spoken_clock_time(frame["hour"], frame["minutes"])
+        on_days = f" {spoken_days(frame['days'])}" if frame.get("days") else ""
+        return f"Alarm set for {when}{on_days}{for_label}.", frames
 
     phrases = [_phrase(f) for f in frames]
     joined = ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
     return f"I've set {joined}.", frames
-
-
-def build_show_action(*, intent: str) -> tuple:
-    """(spoken reply, [frame]) for show_timers / show_alarms.
-
-    Deliberately NOT a cancel: Samsung Clock's public AlarmClock intents can create but never
-    cancel (DISMISS_TIMER is ignored for running timers, DISMISS_ALARM by label is ignored
-    outright -- verified on the Tab A9+), so a cancel frame would be a lie. Opening the Clock
-    screen is the honest capability, and the reply says plainly that Robin cannot do it
-    itself. Unlike set_*, this frame DOES take over the screen -- that is the point."""
-    # Lead with the ACTION, not the limitation. The old wording opened with "I can't...",
-    # which users heard as "this feature does not exist" even though the screen was opening
-    # in front of them. Still honest -- it never claims to have read or cancelled anything.
-    if intent == "show_alarms":
-        return ("Opening your alarm screen now — you can see and change your alarms there."
-                ), [{"type": "show_alarms"}]
-    return ("Opening your timer screen now — you can see and stop your timers there."
-            ), [{"type": "show_timers"}]

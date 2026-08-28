@@ -22,6 +22,7 @@ import logging
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 
@@ -74,7 +75,12 @@ def _append_bench(name, obj):
 def _load_stt():
     import nemo.collections.asr as nemo_asr
     # Load on CPU first, then move — NeMo's direct-to-GPU restore OOMs the 4 GB card.
-    m = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v3", map_location="cpu")
+    # parakeet-tdt-1.1b over 0.6b-v3: benchmarked on 210 logged utterances from real
+    # sessions, it is both FASTER (0.035s vs 0.053s per utterance) and more accurate on this
+    # deployment's problem word -- "alarm" correct 29/36 vs 26/36 -- and it recovered two
+    # quiet clips the 0.6b dropped to an empty transcript, i.e. two user requests that
+    # silently vanished. Whisper large-v3 scored 30/36 but costs 6x the latency.
+    m = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-1.1b", map_location="cpu")
     if torch.cuda.is_available():
         m = m.to("cuda")
     m.eval()
@@ -156,8 +162,17 @@ def decode_to_wav(audio_bytes, wav16):
     return wav16
 
 
+# One GPU, one copy of each model, and turns now run as concurrent tasks -- two overlapping
+# connections transcribing at the same instant made NeMo raise "Cannot unfreeze partially
+# without first freezing the module", killing one of the turns. These models are not safe for
+# concurrent use, so serialise them. Both are fast (STT ~0.035s, TTS ~0.05s/sentence) next to
+# the ~2s LLM step, so the queueing cost is negligible.
+_STT_LOCK = threading.Lock()
+_TTS_LOCK = threading.Lock()
+
+
 def stt_transcribe(wav16):
-    with torch.inference_mode():
+    with _STT_LOCK, torch.inference_mode():
         out = stt_model.transcribe([wav16])
     hyp = out[0]
     return (hyp.text if hasattr(hyp, "text") else str(hyp)).strip()
@@ -166,9 +181,10 @@ def stt_transcribe(wav16):
 def synth_audio(text):
     """Kokoro synth -> one concatenated float32 array (24 kHz)."""
     chunks = []
-    for gs, ps, audio in pipe(text, voice=VOICE):
-        a = audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio, dtype="float32")
-        chunks.append(np.asarray(a, dtype="float32").reshape(-1))
+    with _TTS_LOCK:
+        for gs, ps, audio in pipe(text, voice=VOICE):
+            a = audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio, dtype="float32")
+            chunks.append(np.asarray(a, dtype="float32").reshape(-1))
     return np.concatenate(chunks) if chunks else np.zeros(1, dtype="float32")
 
 
@@ -373,7 +389,10 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
 
     Runs behind SESSION_LOCK[user_id]: send_greet (triggered from the dashboard) writes to the
     same socket from a separate request, and the two must never interleave their frames."""
-    async with SESSION_LOCK[user_id]:
+    lock = SESSION_LOCK.get(user_id)
+    if lock is None:                             # session torn down mid-turn; keep talking
+        lock = SESSION_LOCK[user_id] = asyncio.Lock()
+    async with lock:
         await ws.send_json({"type": "turn_start", "turn_id": turn_id})
         t_llm = time.perf_counter()
         result = await asyncio.to_thread(
@@ -394,7 +413,13 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
             await ws.send_json(action)
             log.info("turn %s  client_action %s", turn_id, action)
         if awaits_cancel:
-            reply = await _await_cancel_result(user_id, result, turn_id)
+            reply, ok = await _await_cancel_result(user_id, result, turn_id)
+            # An edit is cancel-then-recreate: only recreate once the device confirms the
+            # cancel applied, or a failed cancel would leave the user with two alarms.
+            if ok:
+                for action in result.get("actions_after_ok") or []:
+                    await ws.send_json(action)
+                    log.info("turn %s  client_action %s", turn_id, action)
             # process_turn already logged the optimistic wording; correct it so a later turn
             # reasons from what Robin actually said, not from what it hoped to say.
             if history and history[-1].get("role") == "assistant":
@@ -408,12 +433,18 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
                 ttfs = time.perf_counter() - t_llm
             tts_total += await send_sentence(ws, sentence, reply_chunks, idx)
             idx += 1
+        # If Robin just ASKED something, the user needs thinking time before answering.
+        # Reuse the greet path's longer arm window: live, "What time should that alarm go
+        # off?" was followed by ARM_TIMEOUT five seconds later, so the question could not be
+        # answered at all and the turn was wasted.
+        if reply.strip().endswith("?") and not should_end:
+            SESSION_GREET_PENDING[user_id] = True
         await ws.send_json({"type": "done", "ending": should_end})
     return reply, reply_chunks, llm_dt, ttfs, tts_total, llm_dt, should_end
 
 
 async def _await_cancel_result(user_id, result, turn_id):
-    """Block briefly on the device's cancel_result and return the wording to actually speak.
+    """Block briefly on the device's cancel_result -> (wording to speak, applied?).
     A timeout is treated as failure, deliberately: if we never heard back we do not know the
     cancel applied, and claiming it did is exactly the failure mode this handshake exists to
     prevent."""
@@ -427,15 +458,15 @@ async def _await_cancel_result(user_id, result, turn_id):
 
     if res is None:
         log.warning("turn %s  cancel_result timed out after %.1fs", turn_id, CANCEL_RESULT_TIMEOUT_S)
-        return result.get("reply_on_fail") or result["reply"]
+        return (result.get("reply_on_fail") or result["reply"]), False
     log.info("turn %s  cancel_result %s", turn_id, res)
     if not res.get("ok"):
-        return result.get("reply_on_fail") or result["reply"]
+        return (result.get("reply_on_fail") or result["reply"]), False
     noun = result.get("cancel_all_noun")
     if noun:                                     # all-cancel: the device owns the real count
         from robin_conversation.clock import all_cancel_reply
-        return all_cancel_reply(res.get("count"), noun)
-    return result["reply"]
+        return all_cancel_reply(res.get("count"), noun), True
+    return result["reply"], True
 
 
 GREET_TEXT = "How is your day going?"
@@ -451,7 +482,7 @@ async def send_greet(session_id, text=GREET_TEXT):
     ws = SESSION_WS.get(session_id)
     if ws is None:
         return False
-    async with SESSION_LOCK[session_id]:
+    async with SESSION_LOCK.setdefault(session_id, asyncio.Lock()):
         tid = f"{session_id}_greet{int(time.time())}"
         await ws.send_json({"type": "turn_start", "turn_id": tid})
         reply_chunks, idx = [], 0
@@ -492,7 +523,7 @@ async def ws_endpoint(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept(subprotocol=API_KEY)
-    session = time.strftime("%Y%m%d_%H%M%S")
+    session = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"   # suffix: second resolution alone collides
     log.info("ws connected  session=%s", session)
     _session_connect(session, "classic", _client_ip(ws))
     history = []                                              # per-connection conversation memory
@@ -635,7 +666,7 @@ async def ws_stream_endpoint(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept(subprotocol=API_KEY)
-    session = time.strftime("%Y%m%d_%H%M%S")
+    session = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"   # suffix: second resolution alone collides
     log.info("ws-stream connected  session=%s  turn_mode=%s", session, TURN_MODE)
     _session_connect(session, TURN_MODE, _client_ip(ws))
     history = []                                              # per-connection conversation memory
@@ -682,8 +713,12 @@ async def _run_hold(ws, session, history):
                 elif typ == "clock_state":
                     # Full snapshot from the device; replaces whatever we had.
                     SESSION_CLOCK[session] = data
-                    log.info("clock_state session=%s timers=%d alarms=%d ringing=%s", session,
-                             len(data.get("timers") or []), len(data.get("alarms") or []),
+                    # Log the alarms in full: counts alone made a "did the repeat days
+                    # survive?" question impossible to answer from the log afterwards.
+                    log.info("clock_state session=%s timers=%d alarms=%s ringing=%s", session,
+                             len(data.get("timers") or []),
+                             [{k: a.get(k) for k in ("id", "hour", "minutes", "days", "label")}
+                              for a in (data.get("alarms") or [])],
                              bool(data.get("ringing")))
                 elif typ == "end":
                     turn += 1
@@ -751,8 +786,12 @@ async def _run_tap(ws, session, history):
                 elif typ == "clock_state":
                     # Full snapshot from the device; replaces whatever we had.
                     SESSION_CLOCK[session] = data
-                    log.info("clock_state session=%s timers=%d alarms=%d ringing=%s", session,
-                             len(data.get("timers") or []), len(data.get("alarms") or []),
+                    # Log the alarms in full: counts alone made a "did the repeat days
+                    # survive?" question impossible to answer from the log afterwards.
+                    log.info("clock_state session=%s timers=%d alarms=%s ringing=%s", session,
+                             len(data.get("timers") or []),
+                             [{k: a.get(k) for k in ("id", "hour", "minutes", "days", "label")}
+                              for a in (data.get("alarms") or [])],
                              bool(data.get("ringing")))
                 elif typ == "turn_start":
                     if ingest is None:

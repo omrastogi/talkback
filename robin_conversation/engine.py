@@ -17,11 +17,14 @@ turns straight back to reminder_handler (an ongoing reminder dialog) until it re
 Without one, reminder-classified messages just fall through to the normal conversational
 reply, same as any other unsupported capability.
 """
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .asr_fixes import repair_transcript
 from .classifier import classify_conversation_intent, is_affirmation_intent
 from .clock import (
     build_clock_cancel_action,
+    build_clock_modify_action,
     build_clock_query_reply,
     build_stop_ring_action,
     format_clock_context,
@@ -29,7 +32,6 @@ from .clock import (
 )
 from .intent_handlers import (
     build_capabilities_message,
-    build_show_action,
     build_timer_action,
     build_delete_message_confirmation,
     build_end_conversation_message,
@@ -43,8 +45,28 @@ from .prompt_context import build_conversation_prompt_context
 # but the classifier only sees that turn's text, so a bare "thirty seconds" or "no, make it
 # five" lands in `conversation` and the request stalls. These markers let the engine route the
 # answer back to the timer flow, the same shape as the delete-confirmation gate below.
-TIMER_PENDING_MARKERS = ("how long would you like it for",)
-ALARM_PENDING_MARKERS = ("what time should i set it for",)
+# "delete the 8:30 alarm" is a clock request, not a request to delete a chat message.
+_CLOCK_WORDS = re.compile(r"\b(alarm|alarms|timer|timers)\b", re.IGNORECASE)
+
+# "make it every weekday" right after "Alarm set for 7 AM." is a modification of what was
+# just set, but on its own it looks like small talk and fell through to a refusal.
+_MODIFY_OPENERS = re.compile(r"^\s*(no|nope|actually|make it|change it|instead|i meant|i said)\b",
+                             re.IGNORECASE)
+_SET_CONFIRMED = ("timer set", "alarm set", "i've set")
+# Day words right after a confirmed set are almost always about THAT alarm ("make it every
+# weekday", "didn't I ask for Monday Tuesday Wednesday"), but on their own they drag the
+# classifier into schedule_query and the user gets their calendar read back.
+_DAY_WORDS = re.compile(r"\b(mon|tues|wednes|thurs|fri|satur|sun)day\b|\bweekdays?\b"
+                        r"|\bweekends?\b|\bdaily\b|\bevery (?:day|week)\b", re.IGNORECASE)
+
+# These must match the exact questions build_timer_action asks. Keep them in sync: rewording
+# a question without updating its marker silently disables the follow-up gate, which is how
+# "alarm for Monday, Tuesday, Wednesday" + "at eight thirty" lost its days.
+TIMER_PENDING_MARKERS = ("how long would you like it for",
+                         "how long should i set it for")
+ALARM_PENDING_MARKERS = ("what time should i set it for",
+                         "what time should that alarm go off",
+                         "which days should that alarm go off")
 
 REMINDER_CHAIN_MARKER = "REMINDER_AGENT"
 DELETE_CONFIRMATION_CHAIN_MARKER = "DELETE_CONFIRMATION_PENDING"
@@ -98,14 +120,19 @@ def _resolve_pending_followup(history: List[Dict[str, Any]], content: str, user_
     ):
         return None
 
-    history.append({"role": "user", "content": content})
     if is_affirmation_intent(content, user_id):
+        history.append({"role": "user", "content": content})
         _redact_last_two_before(history, len(history) - 2)
         reply = "I have deleted the last message. Is there anything else I can help you with?"
-    else:
-        reply = "Is there anything else I can help you with?"
-    history.append({"role": "assistant", "content": reply})
-    return reply
+        history.append({"role": "assistant", "content": reply})
+        return reply
+
+    # Not a yes. The user has almost always moved on to a real request -- live, "can you
+    # delete the alarm for eight thirty please" arrived here and was consumed by a bland
+    # "Is there anything else I can help you with?", throwing the request away and costing
+    # the user two more turns. Clear the gate and let normal routing handle this turn.
+    last_message["require_affirmation"] = False
+    return None
 
 
 def _run_default_conversation_flow(history: List[Dict[str, Any]], context: Dict[str, Any]) -> str:
@@ -146,6 +173,11 @@ def process_turn(
     weather, a bundled dummy schedule/capabilities text, no profile/steps unless you wire
     those up (see prompt_context.py).
     """
+    # Repair known speech-recognition mishearings once, up front, so classification,
+    # extraction and cancel-resolution all see the same corrected text. "what announced do I
+    # have" was being answered with the day's calendar instead of the user's alarms.
+    content = repair_transcript(content)
+
     if context is None:
         context = build_conversation_prompt_context(user_id, location_coordinates=location_coordinates)
     # The device owns the clock and pushes its whole state up; put it in the prompt so an
@@ -164,6 +196,17 @@ def process_turn(
 
     intent = classify_conversation_intent(content, user_id)
 
+    if intent == "delete_message" and _CLOCK_WORDS.search(content or ""):
+        intent = "clock_cancel"
+
+    # A modification of the thing just set belongs in the timer flow, which knows how to
+    # treat it as a correction, not in ordinary conversation.
+    _prev = (history[-1]["content"] if history and history[-1].get("role") == "assistant" else "").lower()
+    if (intent in ("conversation", "affirmation", "schedule_query")
+            and any(marker in _prev for marker in _SET_CONFIRMED)
+            and (_MODIFY_OPENERS.search(content or "") or _DAY_WORDS.search(content or ""))):
+        intent = "set_alarm" if "alarm set" in _prev else "set_timer"
+
     # While something is actually ringing, a bare "stop"/"okay" is aimed at the noise. The
     # classifier cannot know that -- only the device state does.
     if ringing(clock_state) and intent in ("end_conversation", "conversation", "affirmation"):
@@ -172,11 +215,17 @@ def process_turn(
     # Robin asked for the missing duration/time on the previous turn -> treat this turn as the
     # answer, whatever the classifier made of it on its own.
     last_reply = (history[-1]["content"] if history and history[-1]["role"] == "assistant" else "").lower()
-    if intent not in ("show_timers", "show_alarms", "end_conversation"):
-        if any(marker in last_reply for marker in TIMER_PENDING_MARKERS):
-            intent = "set_timer"
-        elif any(marker in last_reply for marker in ALARM_PENDING_MARKERS):
-            intent = "set_alarm"
+    prior_request = ""
+    if intent != "end_conversation":
+        if any(marker in last_reply for marker in TIMER_PENDING_MARKERS + ALARM_PENDING_MARKERS):
+            intent = "set_timer" if any(m in last_reply for m in TIMER_PENDING_MARKERS) else "set_alarm"
+            # The answer to "what time?" carries only the time -- the DAYS were in the turn
+            # before it. Without this, "alarm for Monday Tuesday Wednesday" + "at eight
+            # thirty" produced a one-off 8:30 alarm and silently lost the days.
+            for message in reversed(history[:-1]):
+                if message.get("role") == "user":
+                    prior_request = message.get("content", "")
+                    break
 
     if intent == "reminder" and reminder_handler is not None:
         history.append({"role": "user", "content": content})
@@ -209,6 +258,12 @@ def process_turn(
         return {"reply": reply, "intent": intent, "should_end_session": False,
                 "client_actions": client_actions}
 
+    if intent == "clock_modify":
+        reply, client_actions, extra = build_clock_modify_action(user_message=content, state=clock_state)
+        history.append({"role": "assistant", "content": reply})
+        return {"reply": reply, "intent": intent, "should_end_session": False,
+                "client_actions": client_actions, **extra}
+
     if intent == "clock_cancel":
         reply, client_actions, extra = build_clock_cancel_action(user_message=content, state=clock_state)
         history.append({"role": "assistant", "content": reply})
@@ -221,19 +276,14 @@ def process_turn(
         return {"reply": reply, "intent": intent, "should_end_session": False,
                 "client_actions": []}
 
-    if intent in ("show_timers", "show_alarms"):
-        reply, client_actions = build_show_action(intent=intent)
-        history.append({"role": "assistant", "content": reply})
-        return {"reply": reply, "intent": intent, "should_end_session": False,
-                "client_actions": client_actions}
-
     if intent in ("set_timer", "set_alarm"):
         # history[-1] is the user turn just appended; [-2] is Robin's previous line, which is
         # what makes "no, only thirty seconds" recognisable as a correction rather than a
         # second timer.
         previous_reply = history[-2]["content"] if len(history) >= 2 else ""
         reply, client_actions = build_timer_action(user_message=content, intent=intent,
-                                                   previous_reply=previous_reply)
+                                                   previous_reply=previous_reply,
+                                                   prior_request=prior_request)
         history.append({"role": "assistant", "content": reply})
         return {"reply": reply, "intent": intent, "should_end_session": False,
                 "client_actions": client_actions}

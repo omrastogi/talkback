@@ -14,11 +14,10 @@ logger = logging.getLogger(__name__)
 INTENT_FLAGS_PATH = Path(__file__).with_name("intent_feature_flags.json")
 DEFAULT_PRECEDENCE = [
     "stop_ring",
+    "clock_modify",
     "clock_cancel",
     "clock_query",
     "end_conversation",
-    "show_timers",
-    "show_alarms",
     "set_timer",
     "set_alarm",
     "reminder",
@@ -59,6 +58,25 @@ INTENT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"input": "goodbye", "output": False},
         ],
     },
+    "clock_modify": {
+        "description": (
+            "User wants to CHANGE an existing timer or alarm rather than remove it outright "
+            "-- move it to a different time, add or drop days while keeping the rest, or "
+            "rename it. Key giveaway: they keep part of it ('remove Monday but keep Tuesday "
+            "and Friday', 'make it 9 instead', 'also on Sunday'). Removing it entirely is "
+            "clock_cancel; creating a new one is set_timer/set_alarm."
+        ),
+        "few_shots": [
+            {"input": "remove the alarm on monday but keep tuesday and friday", "output": True},
+            {"input": "move my 8:30 alarm to 9", "output": True},
+            {"input": "change the alarm to weekdays only", "output": True},
+            {"input": "add sunday to that alarm", "output": True},
+            {"input": "make the tea timer ten minutes instead", "output": True},
+            {"input": "cancel the tea timer", "output": False},
+            {"input": "delete all my alarms", "output": False},
+            {"input": "set an alarm for 7 am", "output": False},
+        ],
+    },
     "clock_cancel": {
         "description": (
             "User wants to CANCEL, delete, or remove a timer or alarm that already exists -- "
@@ -91,43 +109,6 @@ INTENT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"input": "set a timer for five minutes", "output": False},
         ],
     },
-    "show_timers": {
-        "description": (
-            "User wants to see, check, list, count, change, stop, cancel, or delete a TIMER "
-            "(or all timers) that already exists -- including simply asking what timers are "
-            "running. Creating a new timer is set_timer, not this."
-        ),
-        "few_shots": [
-            {"input": "cancel my timer", "output": True},
-            {"input": "remove all timers", "output": True},
-            {"input": "stop the pasta timer", "output": True},
-            {"input": "what timers do i have", "output": True},
-            {"input": "show me my timers", "output": True},
-            {"input": "how long is left on my timer", "output": True},
-            {"input": "check my timers", "output": True},
-            {"input": "how many timers are running", "output": True},
-            {"input": "do i have any timers going", "output": True},
-            {"input": "set a timer for five minutes", "output": False},
-            {"input": "cancel my alarm", "output": False},
-        ],
-    },
-    "show_alarms": {
-        "description": (
-            "User wants to see, check, list, change, turn off, cancel, or delete an ALARM (or "
-            "all alarms) that already exists -- including simply asking what alarms are set. "
-            "Creating a new alarm is set_alarm, not this."
-        ),
-        "few_shots": [
-            {"input": "cancel my alarm", "output": True},
-            {"input": "turn off my morning alarm", "output": True},
-            {"input": "what alarms do i have set", "output": True},
-            {"input": "delete all my alarms", "output": True},
-            {"input": "check my alarms", "output": True},
-            {"input": "what time is my alarm set for", "output": True},
-            {"input": "set an alarm for 7 am", "output": False},
-            {"input": "cancel my timer", "output": False},
-        ],
-    },
     "set_timer": {
         "description": (
             "User asks to start a countdown for a RELATIVE duration -- a timer for some "
@@ -153,6 +134,8 @@ INTENT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "few_shots": [
             {"input": "set an alarm for 7 am", "output": True},
             {"input": "wake me up at half past six", "output": True},
+            {"input": "set an announc for eight thirty in the morning", "output": True},
+            {"input": "can you add a numb for six thirty pm", "output": True},
             {"input": "alarm at 19:30 for the gym", "output": True},
             {"input": "set a timer for five minutes", "output": False},
             {"input": "what is on my calendar tomorrow", "output": False},
@@ -184,25 +167,44 @@ INTENT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "delete_message": {
         "description": (
-            "User asks to delete the last message, delete a conversation message, "
-            "or remove their recent chat content."
+            "User asks to delete the last MESSAGE, a conversation message, or remove their "
+            "recent chat content -- something that was SAID. Never timers, alarms or "
+            "reminders: those are clock_cancel. If it is unclear what they want deleted, "
+            "this is NOT delete_message."
         ),
         "few_shots": [
             {"input": "delete my last message", "output": True},
             {"input": "can you erase what i just said", "output": True},
             {"input": "delete this reminder", "output": False},
             {"input": "set a reminder for later", "output": False},
+            {"input": "delete the 8:30 alarm", "output": False},
+            {"input": "delete all my timers", "output": False},
+            {"input": "cancel the alarm", "output": False},
+            {"input": "you delete", "output": False},
         ],
     },
     "end_conversation": {
         "description": (
-            "User clearly signals they want to stop, end, or close this conversation."
+            "User signals they are done talking for now -- saying goodbye, or DISMISSING the "
+            "assistant so it stops listening ('go back to sleep', 'stop listening', 'never "
+            "mind', 'that's it'). Dismissing the assistant counts even when it is phrased "
+            "gently or as an instruction rather than a farewell. Asking to stop a TIMER or "
+            "ALARM is not this."
         ),
         "few_shots": [
             {"input": "goodbye", "output": True},
             {"input": "that's all for now", "output": True},
+            {"input": "go back to sleep", "output": True},
+            {"input": "you can go to sleep now", "output": True},
+            {"input": "stop listening", "output": True},
+            {"input": "never mind", "output": True},
+            {"input": "that's it, thanks", "output": True},
+            {"input": "goodnight robin", "output": True},
+            {"input": "nothing else", "output": True},
             {"input": "thanks, remind me at 7 pm", "output": False},
             {"input": "delete my last message", "output": False},
+            {"input": "stop the tea timer", "output": False},
+            {"input": "cancel all my alarms", "output": False},
         ],
     },
     "capabilities_query": {
@@ -234,7 +236,9 @@ INTENT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     "schedule_query": {
         "description": (
             "User explicitly asks about their calendar, schedule, agenda, plans, or activities for today, later today, "
-            "tomorrow, or another upcoming day."
+            "tomorrow, or another upcoming day. NOT about timers or alarms -- speech "
+            "recognition often mangles 'alarms' into 'anarms', 'announced', 'announc' or "
+            "'a numb', and those questions are clock_query, never schedule."
         ),
         "few_shots": [
             {"input": "what's on my calendar", "output": True},
@@ -242,6 +246,9 @@ INTENT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             {"input": "do I have any plans later today", "output": True},
             {"input": "what's the weather tomorrow", "output": False},
             {"input": "what can you do", "output": False},
+            {"input": "what anarms do i have today", "output": False},
+            {"input": "can you tell me what all announced do i have", "output": False},
+            {"input": "what alarms do i have today", "output": False},
         ],
     },
     "conversation": {
@@ -365,10 +372,10 @@ Rules:
 - Return one key named "intent".
 - The "intent" value must be one of: {", ".join([f'"{name}"' for name in enabled_intents])}, "none".
 - Return "stop_ring" when the user wants to silence something that is ringing right now.
-- Return "clock_cancel" when the user wants an EXISTING timer or alarm cancelled or deleted.
+- Return "end_conversation" when the user dismisses the assistant so it stops listening ("go back to sleep", "stop listening", "never mind"), not just for explicit farewells.
+- Return "clock_modify" when the user wants to CHANGE an existing timer/alarm but keep it (different time, some days added or dropped while others stay).
+- Return "clock_cancel" when the user wants an EXISTING timer or alarm cancelled or deleted entirely.
 - Return "clock_query" when the user is ASKING what timers/alarms exist, how many, how long is left, or when the next one is.
-- Return "show_timers" / "show_alarms" only when the user explicitly asks to SEE the clock screen itself.
-- Return "show_timers" / "show_alarms" when the user wants to see, check, list, change, stop or cancel a timer/alarm that ALREADY exists, rather than create a new one.
 - Return "set_timer" when the user asks to count down a relative duration (minutes/seconds/hours from now).
 - Return "set_alarm" when the user asks to be alerted at a specific clock time.
 - Only return "reminder" when the user is explicitly asking to create, set, change, or manage a reminder, or asking to view, list, or query their reminders, or asking to delete or remove a reminder.
@@ -411,8 +418,8 @@ def classify_routing_intent(message: str, user_id: str) -> str:
     return classify_primary_intent(
         message,
         user_id,
-        ["conversation", "capabilities_query", "weather_query", "schedule_query", "stop_ring", "clock_cancel", "clock_query", "show_timers", "show_alarms", "set_timer", "set_alarm", "reminder", "delete_message", "end_conversation"],
-        precedence=["stop_ring", "clock_cancel", "clock_query", "end_conversation", "show_timers", "show_alarms", "set_timer", "set_alarm", "reminder", "delete_message", "weather_query", "schedule_query", "capabilities_query", "conversation"],
+        ["conversation", "capabilities_query", "weather_query", "schedule_query", "stop_ring", "clock_modify", "clock_cancel", "clock_query", "set_timer", "set_alarm", "reminder", "delete_message", "end_conversation"],
+        precedence=["stop_ring", "clock_modify", "clock_cancel", "clock_query", "end_conversation", "set_timer", "set_alarm", "reminder", "delete_message", "weather_query", "schedule_query", "capabilities_query", "conversation"],
     )
 
 
