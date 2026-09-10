@@ -26,10 +26,18 @@ def build_delete_message_confirmation() -> str:
     return "Are you sure you want to delete the last message?"
 
 
+# One clause each, deliberately: a goodbye is the one reply nobody is waiting around for, and
+# the two-sentence versions cost a second TTS call and a second audio frame (server.py splits
+# on _SENT_RE) to say the same thing twice.
 END_CONVERSATION_MESSAGES = (
-    "Goodbye. I'll talk to you later.",
-    "Talk to you later. Goodbye.",
-    "Goodbye for now. Talk soon.",
+    "I'll talk to you later.",
+    "Talk soon.",
+    "Goodbye for now.",
+    "Goodbye",
+    "Sayonara",
+    # Spelled "Aa", not "Adiós": the accented o sends misaki down the English letter-by-letter
+    # path and it comes out "AY-dih-ohz". This spelling gets the opening "ah" (out/adios_3.wav).
+    "Aadios Amigo",
 )
 
 

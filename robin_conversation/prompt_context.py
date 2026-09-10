@@ -16,6 +16,7 @@ DB-backed pieces are replaced with either plain parameters or graceful local-fil
     callable to engine.process_turn()/this module's context builder if you want it filled in.
 """
 import json
+import math
 import random
 from datetime import datetime
 from pathlib import Path
@@ -115,8 +116,8 @@ def steps_info_for_conversation(total_steps) -> str:
     return f"{format_number_for_tts(total_steps)} steps"
 
 
-def get_temporal_context() -> Dict[str, str]:
-    now_est = datetime.now(EASTERN_TZ)
+def get_temporal_context(tz: Optional[ZoneInfo] = None) -> Dict[str, str]:
+    now_est = datetime.now(tz or EASTERN_TZ)
     return {
         "current_day": now_est.strftime("%A"),
         "current_date": now_est.strftime("%B %d, %Y"),
@@ -132,7 +133,15 @@ def _format_current_weather_summary(temperature, weather_code) -> str:
     return f"{round(temperature)} degrees Fahrenheit and {_weather_description(weather_code)}"
 
 
-def _build_hourly_forecast_entries(data, *, now_est: datetime, limit: int = 6):
+def _tz_from_response(data) -> ZoneInfo:
+    """Zone open-meteo resolved for these coordinates; Eastern if it is missing or unknown."""
+    try:
+        return ZoneInfo(data["timezone"])
+    except Exception:
+        return EASTERN_TZ
+
+
+def _build_hourly_forecast_entries(data, *, now_est: datetime, tz: ZoneInfo = EASTERN_TZ, limit: int = 6):
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
     temperatures = hourly.get("temperature_2m", [])
@@ -146,8 +155,8 @@ def _build_hourly_forecast_entries(data, *, now_est: datetime, limit: int = 6):
         except Exception:
             continue
         if forecast_dt.tzinfo is None:
-            forecast_dt = forecast_dt.replace(tzinfo=EASTERN_TZ)
-        forecast_dt = forecast_dt.astimezone(EASTERN_TZ)
+            forecast_dt = forecast_dt.replace(tzinfo=tz)
+        forecast_dt = forecast_dt.astimezone(tz)
         if forecast_dt < now_est:
             continue
 
@@ -190,25 +199,83 @@ def _build_daily_forecast_entries(data, *, limit: int = 3):
     return entries
 
 
+_GEOCODE_CACHE: Dict[tuple, Optional[str]] = {}
+
+
+def get_location_context(location_coordinates: Optional[Dict[str, float]] = None) -> Optional[str]:
+    """Human-readable place for coordinates the DEVICE supplied, or None.
+
+    Returns None when no valid coordinates were provided. That is deliberate and load-bearing:
+    DEFAULT_LOCATION still powers the weather call (unchanged behaviour), but presenting it as
+    "you are in Boston" to a user who never shared a location would be a confident falsehood --
+    strictly worse than Robin saying it does not know. Only a real fix belongs here.
+
+    Coordinates are rounded to 2 dp (~1 km) before the lookup: enough for "which town", and it
+    both keeps a precise address out of a third party's logs and makes the cache actually hit.
+    """
+    if not _valid_coords(location_coordinates or {}):
+        return None
+    # An operator-supplied name is authoritative and skips the network call entirely.
+    if location_coordinates.get("name"):
+        return location_coordinates["name"]
+    key = (round(float(location_coordinates["lat"]), 2),
+           round(float(location_coordinates["lon"]), 2))
+    if key in _GEOCODE_CACHE:
+        return _GEOCODE_CACHE[key]
+    place = None
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": key[0], "lon": key[1], "format": "json", "zoom": 12},
+            headers={"User-Agent": "robin-voice-companion/1.0"},   # Nominatim rejects blank UA
+            timeout=6,
+        )
+        r.raise_for_status()
+        a = (r.json() or {}).get("address", {}) or {}
+        parts = [a.get("city") or a.get("town") or a.get("village") or a.get("suburb"),
+                 a.get("state"), a.get("country")]
+        place = ", ".join([x for x in parts if x]) or None
+    except Exception:
+        place = None          # network/service failure -> unknown, never a guess
+    _GEOCODE_CACHE[key] = place
+    return place
+
+
+def _valid_coords(c) -> bool:
+    """Guard the URL interpolation. The server validates too, but this is the last line of
+    defence before coordinates become part of an outbound third-party request."""
+    try:
+        lat, lon = float(c["lat"]), float(c["lon"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (math.isfinite(lat) and math.isfinite(lon)
+            and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0)
+
+
 def get_weather_context(location_coordinates: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
-    coords = location_coordinates or DEFAULT_LOCATION
+    coords = location_coordinates if _valid_coords(location_coordinates or {}) else DEFAULT_LOCATION
+    # timezone=auto: open-meteo returns timestamps in the LOCAL time of those coordinates and
+    # echoes the zone name back. Previously this was pinned to America/New_York, so a device
+    # outside Eastern would have had correct temperatures printed against wrong hour labels --
+    # "3 PM" meaning 3 PM in Boston. The echoed zone is what the formatters below use.
     url = (
         f"https://api.open-meteo.com/v1/forecast?"
         f"latitude={coords['lat']}&longitude={coords['lon']}"
         "&current=temperature_2m,weather_code"
         "&hourly=temperature_2m,weather_code,precipitation_probability"
         "&daily=weather_code,temperature_2m_max,temperature_2m_min"
-        "&temperature_unit=fahrenheit&timezone=America%2FNew_York&forecast_days=4"
+        "&temperature_unit=fahrenheit&timezone=auto&forecast_days=4"
     )
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
         current = data["current"]
-        now_est = datetime.now(EASTERN_TZ)
+        tz = _tz_from_response(data)
+        now_local = datetime.now(tz)
         return {
             "current_summary": _format_current_weather_summary(current["temperature_2m"], current["weather_code"]),
-            "hourly_forecast": _build_hourly_forecast_entries(data, now_est=now_est),
+            "hourly_forecast": _build_hourly_forecast_entries(data, now_est=now_local, tz=tz),
             "daily_forecast": _build_daily_forecast_entries(data),
         }
     except Exception:
@@ -299,13 +366,23 @@ def build_conversation_prompt_context(
     speaker_profile_key: Optional[str] = None,
     location_coordinates: Optional[Dict[str, float]] = None,
     steps_provider: Optional[Callable[[str], Optional[int]]] = None,
+    tz: Optional[ZoneInfo] = None,
 ) -> Dict[str, Any]:
-    """Same shape as recover/prompt_context/conversation.py's build_conversation_prompt_context."""
+    """Same shape as recover/prompt_context/conversation.py's build_conversation_prompt_context.
+
+    `tz` localizes the temporal context (day/date/time-of-day) to the profile's timezone;
+    default stays EASTERN_TZ for callers that predate per-profile timezones."""
     flags = get_prompt_feature_flags()
     context: Dict[str, Any] = {}
 
     if flags["include_temporal_context"]:
-        context.update(get_temporal_context())
+        context.update(get_temporal_context(tz))
+
+    # Location is reported ONLY when the device supplied it; otherwise the key is absent and
+    # the model is told nothing, so it answers "I do not know" rather than naming the default.
+    place = get_location_context(location_coordinates)
+    if place:
+        context["location_info"] = place
 
     if flags["include_weather"]:
         weather = get_weather_context(location_coordinates)

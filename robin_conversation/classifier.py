@@ -187,12 +187,13 @@ INTENT_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": (
             "User signals they are done talking for now -- saying goodbye, or DISMISSING the "
             "assistant so it stops listening ('go back to sleep', 'stop listening', 'never "
-            "mind', 'that's it'). Dismissing the assistant counts even when it is phrased "
-            "gently or as an instruction rather than a farewell. Asking to stop a TIMER or "
-            "ALARM is not this."
+            "mind', 'that's it', 'shut up', 'quiet please'). Dismissing the assistant counts "
+            "even when it is phrased gently or as an instruction rather than a farewell. "
+            "Asking to stop a TIMER or ALARM is not this."
         ),
         "few_shots": [
             {"input": "goodbye", "output": True},
+            {"input": "shutup", "output": False},
             {"input": "that's all for now", "output": True},
             {"input": "go back to sleep", "output": True},
             {"input": "you can go to sleep now", "output": True},

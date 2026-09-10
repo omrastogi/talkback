@@ -38,41 +38,44 @@ Everything below describes `tap` mode except where marked `[hold only]`.
 
 ## Authentication
 
-Both `/ws` and `/ws-stream` are gated by a shared secret, `ROBIN_API_KEY` (`config.py:api_key`,
-checked via `_check_auth` in `server.py:189`). If `ROBIN_API_KEY` is unset on the server, auth
-is **disabled** — every connection is accepted, and the server logs a startup warning
-(`server.py:99-101`). This is meant for local dev only; the deployed gateway sets it.
+Both `/ws` and `/ws-stream` are gated by a **per-device token** bound to one profile row in
+Postgres (`robin/ws.py:bind_device_session`; full model, provisioning CLI, and the dashboard
+HTTP API in `robin/README.md`). Tokens are issued by the research team with
+`python -m robin.admin issue-device-token` and shown exactly once; the server stores only the
+SHA-256. There is no unauthenticated mode: a connection without a valid device token is always
+rejected. (The old `ROBIN_API_KEY` shared secret no longer grants voice-socket access — it
+still gates the legacy HTTP dashboard endpoints, see below.)
 
-**The key travels as a WebSocket subprotocol, not a query parameter.** Pass it as the second
+**The token travels as a WebSocket subprotocol, not a query parameter.** Pass it as the second
 argument to the `WebSocket` constructor:
 
 ```javascript
-const ws = new WebSocket(url, [apiKey]);   // sends `Sec-WebSocket-Protocol: <apiKey>`
+const ws = new WebSocket(url, [deviceToken]);   // sends `Sec-WebSocket-Protocol: <deviceToken>`
 ```
 
-This is deliberate: a query string (`?key=...`) ends up verbatim in both nginx's and uvicorn's
-default access logs on *every* connection attempt, permanently persisting the shared secret in
-cleartext on disk (confirmed empirically — this is not a hypothetical). Headers are not written
-to either's default access-log format, so the subprotocol avoids that leak. The server reads it
-via `ws.headers.get("sec-websocket-protocol")` and compares with `hmac.compare_digest` against
-`ROBIN_API_KEY`. On success, the server echoes the key back as the negotiated subprotocol
-(`ws.accept(subprotocol=API_KEY)`) — the client's `ws.protocol` will equal the key it sent, per
-the WebSocket subprotocol-negotiation spec; there is no separate ack message.
+This is deliberate: a query string (`?token=...`) ends up verbatim in both nginx's and uvicorn's
+default access logs on *every* connection attempt, permanently persisting the credential in
+cleartext on disk (confirmed empirically — this is not a hypothetical), and a device token is a
+longer-lived secret than the shared key ever was. Headers are not written to either's default
+access-log format, so the subprotocol avoids that leak. On success, the server echoes the token
+back as the negotiated subprotocol — the client's `ws.protocol` will equal the token it sent,
+per the WebSocket subprotocol-negotiation spec; there is no separate ack message. The token's
+profile is resolved **server-side**; nothing the client sends can select a different profile.
 
-**On a missing or wrong key**, the server logs a warning with the client's address (from the
-`X-Real-IP` header nginx sets — `_client_ip`, `server.py:183`), then closes the connection with
-WebSocket close code **1008** (policy violation). Note the sequencing: the server calls
-`ws.accept()` and *then* immediately `ws.close(code=1008)`, rather than closing before accepting.
-This is intentional, not an oversight — a close sent *before* the handshake completes fails the
-handshake itself (surfaces to the server as returning a plain HTTP 403, and to a browser as
-close code **1006**, never 1008, since no WebSocket connection was ever actually established to
-carry a protocol-level close code). Accepting first is what makes code 1008 actually observable
-client-side. This costs nothing extra: no audio is ever read on the rejection path, so no
-STT/LLM/TTS work happens either way — the "expensive" work only starts once the caller sends
-audio frames, which a rejected connection never gets to do.
+**On a missing, wrong, revoked, or non-device token** (a dashboard token from `/auth/login` is
+not valid here), the server logs a warning with the client's address (from the `X-Real-IP`
+header nginx sets — `_client_ip`), then closes the connection with WebSocket close code
+**4401**. Note the sequencing: the server calls `ws.accept()` and *then* immediately
+`ws.close(code=4401)`, rather than closing before accepting. This is intentional, not an
+oversight — a close sent *before* the handshake completes fails the handshake itself (surfaces
+to a browser as close code **1006**, never the real code, since no WebSocket connection was
+ever actually established to carry a protocol-level close code). Accepting first is what makes
+code 4401 actually observable client-side. This costs nothing extra: no audio is ever read on
+the rejection path, so no STT/LLM/TTS work happens either way.
 
-A client should treat any close with code 1008 as "bad key, ask the user again" — that's the
-only condition under which the server sends that code.
+A client should treat any close with code 4401 as "this device needs a (re)issued token" —
+that's the only condition under which the server sends that code. (Clients written against the
+old shared-key auth expected 1008; that code is no longer sent.)
 
 ## Audio format sent by client
 
@@ -135,12 +138,15 @@ Notes:
 
 ## Connection lifecycle
 
-1. **Connect**: client opens the WebSocket, passing the API key as a subprotocol (see
-   Authentication above). If `ROBIN_API_KEY` is set and the key is missing/wrong, the server
-   accepts then immediately closes with code 1008 and returns — no session is created, nothing
-   else happens. Otherwise, the server accepts (echoing the key back as the negotiated
-   subprotocol), assigns a `session` id (`time.strftime("%Y%m%d_%H%M%S")`), and logs it;
-   nothing else is sent to the client at this point.
+1. **Connect**: client opens the WebSocket, passing its device token as a subprotocol (see
+   Authentication above). On a bad token the server accepts then immediately closes with code
+   4401 and returns — no session is created, nothing else happens. Otherwise, the server
+   accepts (echoing the token back as the negotiated subprotocol), resolves the token's
+   profile, loads that profile's `voice`/`speech_rate`/`timezone`/`context` for the lifetime
+   of the connection, assigns a human-readable `session` id for logs plus a fresh session
+   UUID under which this connection's turns are persisted (`robin/README.md` §3), and logs
+   it; nothing else is sent to the client at this point. A reconnect is a new session UUID —
+   there is no resume.
 2. **Turn start** (`tap`): client sends `turn_start` (and, once per connection, `start` if it
    wants to declare a non-16000 Hz rate) → server replies `vad_state: ARMED` → client streams
    raw PCM16 binary frames.
@@ -179,5 +185,13 @@ Notes:
 | `GET` | `/` | `tap_index.html` or `stream_index.html` | none | Chosen by the server-side `TURN_MODE` setting, not client-selectable. |
 | `GET` | `/classic` | `index.html` | none | The `/ws` (whole-blob) demo page. |
 | `GET` | `/stream` | `stream_index.html` | none | Direct link to the streaming demo page regardless of `TURN_MODE`. |
+| `GET` | `/dashboard` | `dashboard.html` | none | Live-session dashboard page; its API calls below need the key. |
+| `GET` | `/api/sessions` | JSON session list | `X-Robin-Key` | Live in-memory session registry. |
+| `POST` | `/api/sessions/{id}/greet` | JSON status | `X-Robin-Key` | Speak a greeting into a live session. |
+| `POST` | `/proactive` | JSON `{message_id, status}` | `X-Robin-Key` | External service → spoken utterance (docstring in `server.py`). |
 
-No HTTP route is authenticated — the shared key only gates the two WebSocket routes.
+The `X-Robin-Key` header carries the legacy `ROBIN_API_KEY` shared secret (unset → those
+routes are open; dev only). The account-facing HTTP API — `/auth/login`, `/auth/logout`, and
+the `/profiles/*` endpoints (profile settings and persisted conversation history), all
+authenticated with per-account Bearer tokens — is documented in `robin/README.md`, along with
+the provisioning CLI and the full endpoint map.

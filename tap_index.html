@@ -189,7 +189,30 @@ async function openMic() {
   source.connect(recNode);
   recNode.connect(capCtx.destination);               // keep the graph pulling (worklet emits silence)
   ws.send(JSON.stringify({ type: "start", sampleRate: capCtx.sampleRate }));
+  sendLocation();
   micOpen = true;
+}
+
+// Opt-in location, mirroring the clock_state contract: the client owns it and pushes a full
+// snapshot. Deliberately fire-and-forget -- the browser prompt is async and may be denied or
+// ignored, and a turn must never wait on it. Denied/unavailable simply means the server keeps
+// its default location, which is the behaviour that existed before this frame.
+function sendLocation() {
+  if (!navigator.geolocation || ws.readyState !== WebSocket.OPEN) return;
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({
+        type: "location_state",
+        lat: pos.coords.latitude,
+        lon: pos.coords.longitude,
+        accuracy_m: Math.round(pos.coords.accuracy),
+        source: "browser",
+      }));
+    },
+    (err) => console.info("location unavailable (" + err.message + ") — server default applies"),
+    { enableHighAccuracy: false, timeout: 5000, maximumAge: 600000 }
+  );
 }
 
 async function tap() {

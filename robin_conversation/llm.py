@@ -88,6 +88,8 @@ def build_system_prompt(*, context: Optional[Dict[str, Any]] = None, previous_re
         context_lines.append(f"Current date: {context['current_date']}")
     if "current_time" in context:
         context_lines.append(f"Current time: {context['current_time']}")
+    if "location_info" in context:
+        context_lines.append(f"User's current location: {context['location_info']}")
     if "weather_info" in context:
         context_lines.append(f"Weather information: {context['weather_info']}")
     if "weather_hourly" in context:

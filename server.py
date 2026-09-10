@@ -7,13 +7,16 @@ also run in threads to keep the event loop free.
     conda run -n voice uvicorn server:app --host 0.0.0.0 --port 8000
     # then open http://localhost:8000 in the Windows browser
 """
+import math
 import os
 
 import config   # importing sets PYTORCH_CUDA_ALLOC_CONF before torch loads (see config.py)
 
 import argparse
 import asyncio
+import collections
 import dataclasses
+import datetime
 import functools
 import hmac
 import io
@@ -35,6 +38,9 @@ from fastapi.responses import FileResponse, JSONResponse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VOICE = "af_heart"
+# Played once ahead of a proactive utterance: Robin speaking unprompted needs a moment of
+# warning, or the first words land before the user has looked up.
+CHIME_PATH = os.path.join(HERE, "chime.mp3")
 
 # Per-turn audio + server.log live together under log/; each log line references the
 # turn's wav files by path so you can open the audio straight from the log.
@@ -104,10 +110,13 @@ if not LLM_API_KEY:
     log.warning("no API key for backend '%s' — set %s in .env", ARGS.backend,
                 "OPENAI_API_KEY" if ARGS.backend == "openai" else "PARCS_API_KEY")
 
-# --- WebSocket shared-key auth: ROBIN_API_KEY. Unset -> auth disabled (local dev). ---
+# --- ROBIN_API_KEY now gates only the legacy HTTP dashboard endpoints (X-Robin-Key). The
+# voice WebSockets require a per-device token (see robin/); the shared key no longer grants
+# voice-socket access. ---
 API_KEY = config.api_key()
 if not API_KEY:
-    log.warning("ROBIN_API_KEY not set — WebSocket auth is DISABLED (fine for local dev only)")
+    log.warning("ROBIN_API_KEY not set — legacy HTTP dashboard auth is DISABLED (dev only); "
+                "voice sockets still require a device token")
 
 t = time.time(); stt_model = _load_stt(); STT_LOAD = time.time() - t
 from kokoro import KPipeline
@@ -125,6 +134,13 @@ if LLM_BASE_URL:
 os.environ["CHAT_MODEL_ID"] = MODEL
 os.environ["INTENT_MODEL_ID"] = MODEL
 from robin_conversation import process_turn
+from robin_conversation.prompt_context import build_conversation_prompt_context
+from zoneinfo import ZoneInfo
+
+# Persistence layer (robin/): profile-bound device tokens and per-utterance turn rows.
+# Import is light -- engine creation (and the DATABASE_URL requirement) is deferred until
+# the first connection actually authenticates.
+from robin.ws import bind_device_session, persist_turn
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 log.info("[ready] STT %.1fs · TTS %.1fs · both resident on %s · LLM=%s [%s] · logs -> %s",
          STT_LOAD, TTS_LOAD, _DEVICE, MODEL, ARGS.backend, LOG_DIR)
@@ -178,11 +194,43 @@ def stt_transcribe(wav16):
     return (hyp.text if hasattr(hyp, "text") else str(hyp)).strip()
 
 
-def synth_audio(text):
-    """Kokoro synth -> one concatenated float32 array (24 kHz)."""
+# Kokoro's g2p does not read a clock time: it keeps the colon and says the minutes digit by
+# digit, so "8:00 PM" comes out "eight ZERO ZERO PM" and "08:00" as "zero eight zero zero".
+# Minutes of 10 or more already sound right ("8:30" -> "eight thirty"), so this only has to
+# fix :00 and :0X, leading zeros, and the 24-hour times the calendar data is stored in.
+_CLOCK_RE = re.compile(r"\b(\d{1,2}):([0-5]\d)(\s*[AaPp]\.?[Mm]\.?)?")
+
+
+def _spoken_time(m):
+    hour, minute, meridiem = int(m.group(1)), int(m.group(2)), (m.group(3) or "")
+    if hour > 23:
+        return m.group(0)                        # not a clock time; leave it alone
+    if not meridiem and hour > 12:               # 24-hour, as stored in calendar.json
+        hour, meridiem = hour - 12, " PM"
+    elif not meridiem and hour == 0:
+        hour, meridiem = 12, " AM"
+    if minute == 0:                              # "8:00 PM" -> "8 PM", "12:00" -> "12 o'clock"
+        return f"{hour}{meridiem}" if meridiem else f"{hour} o'clock"
+    if minute < 10:                              # "1:05" -> "1 oh 5", never "one zero five"
+        return f"{hour} oh {minute}{meridiem}"
+    return f"{hour} {minute}{meridiem}"
+
+
+def for_speech(text):
+    """Text as it should be SAID rather than shown. Applied at synthesis only, so the client
+    still displays "8:00 PM" while Robin says "eight PM"."""
+    return _CLOCK_RE.sub(_spoken_time, text)
+
+
+def synth_audio(text, voice=VOICE, speed=1.0):
+    """Kokoro synth -> one concatenated float32 array (24 kHz). Times are rewritten for the
+    voice first (see for_speech); every spoken path lands here, so this is the one place.
+    `voice`/`speed` come from the connection's profile (see SESSION_DB); the defaults keep
+    the historical behaviour for anything unbound."""
+    text = for_speech(text)
     chunks = []
     with _TTS_LOCK:
-        for gs, ps, audio in pipe(text, voice=VOICE):
+        for gs, ps, audio in pipe(text, voice=voice, speed=speed):
             a = audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio, dtype="float32")
             chunks.append(np.asarray(a, dtype="float32").reshape(-1))
     return np.concatenate(chunks) if chunks else np.zeros(1, dtype="float32")
@@ -195,7 +243,59 @@ def wav_bytes(audio):
     return bio.getvalue()
 
 
+_CHIME = None                # decoded on first use, then cached: one ffmpeg call per process
+
+
+def chime_audio():
+    """chime.mp3 -> float32 mono at 24 kHz, the TTS sample rate, so it ships through the very
+    same audio frame a spoken sentence does and the client needs no new message type. A
+    missing or undecodable file is not fatal -- returns None and the utterance plays bare."""
+    global _CHIME
+    if _CHIME is None:
+        _CHIME = np.zeros(0, dtype="float32")      # cache the failure too: don't retry per call
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+                tmp = fh.name
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", CHIME_PATH,
+                            "-ac", "1", "-ar", "24000", tmp], check=True)
+            audio, _ = sf.read(tmp, dtype="float32")
+            _CHIME = np.asarray(audio, dtype="float32").reshape(-1)
+            log.info("[chime] %s loaded (%.2fs)", CHIME_PATH, len(_CHIME) / 24000)
+        except Exception as e:                     # noqa: BLE001 -- chime is decoration, not the message
+            log.warning("chime unavailable (%s): %s", CHIME_PATH, e)
+        finally:
+            if tmp:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    return _CHIME if len(_CHIME) else None
+
+
 app = FastAPI()
+
+# The dashboard frontend (Next.js dev server on :3000) is a different origin, so its
+# fetches preflight; without this middleware every browser call to /auth/* and /profiles/*
+# fails before reaching a handler. Bearer-header auth, not cookies, so no allow_credentials.
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get(
+        "ROBIN_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(","),
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["authorization", "content-type"],
+)
+
+# Dashboard HTTP API: /auth/* (login/logout) and /profiles/* (list, detail, patch, turns),
+# authenticated by per-account Bearer tokens -- separate from the legacy X-Robin-Key gate on
+# the pre-existing endpoints below.
+from robin.api.admin import router as _robin_admin_router        # noqa: E402
+from robin.api.auth import router as _robin_auth_router          # noqa: E402
+from robin.api.profiles import router as _robin_profiles_router  # noqa: E402
+app.include_router(_robin_auth_router)
+app.include_router(_robin_profiles_router)
+app.include_router(_robin_admin_router)
 
 
 def _client_ip(ws: WebSocket) -> str:
@@ -204,22 +304,15 @@ def _client_ip(ws: WebSocket) -> str:
     return ws.headers.get("x-real-ip", "unknown")
 
 
-def _check_auth(ws: WebSocket) -> bool:
-    """True if this connection may proceed. Auth is disabled (returns True) when
-    ROBIN_API_KEY isn't set. The key travels as the Sec-WebSocket-Protocol header (set via
-    the WebSocket constructor's `protocols` argument), NOT a query string -- a query string
-    ends up verbatim in both nginx's and uvicorn's default access logs on every connection,
-    permanently persisting the shared secret in cleartext on disk. Headers aren't logged by
-    either's default access-log format, so this avoids that leak."""
-    if not API_KEY:
-        return True
-    supplied = ws.headers.get("sec-websocket-protocol", "")
-    return hmac.compare_digest(supplied, API_KEY)
-
-
+# The voice sockets no longer use the ROBIN_API_KEY shared secret: they authenticate with
+# per-device tokens (robin.ws.bind_device_session), which travel in the same
+# Sec-WebSocket-Protocol header the shared key used to -- never a query string, because a
+# query string ends up verbatim in nginx's and uvicorn's default access logs on every
+# connection, permanently persisting the credential in cleartext on disk. ROBIN_API_KEY
+# still gates the pre-existing HTTP dashboard endpoints below.
 def _check_http_auth(request: Request) -> bool:
-    """Same gate as _check_auth, for the plain-HTTP dashboard API. The key travels as a
-    custom header (X-Robin-Key), never a query string, for the same log-leak reason as above."""
+    """Shared-key gate for the plain-HTTP dashboard API. The key travels as a custom
+    header (X-Robin-Key), never a query string, for the same log-leak reason as above."""
     if not API_KEY:
         return True
     supplied = request.headers.get("x-robin-key", "")
@@ -241,6 +334,55 @@ SESSION_CLOCK = {}
 # the tea timer" is the same class of lie as a phantom "timer set".
 SESSION_CANCEL_WAITER = {}
 CANCEL_RESULT_TIMEOUT_S = 2.0
+
+# Latest location_state frame per session. Same contract shape as clock_state: the DEVICE owns
+# it and pushes a full snapshot; we keep only the newest. Absent -> process_turn gets None and
+# prompt_context falls back to its hardcoded default, which is the pre-existing behaviour.
+#
+# Coordinates are interpolated into a third-party URL (open-meteo) on weather turns, so they are
+# validated here rather than at the point of use: a malformed frame must degrade to "no location"
+# and never reach the request.
+SESSION_LOCATION = {}
+
+# Operator-configured fallback: ROBIN_LOCATION_LAT / ROBIN_LOCATION_LON (optionally
+# ROBIN_LOCATION_NAME to skip the reverse-geocode lookup entirely).
+#
+# Three tiers, and the distinction matters:
+#   1. device location_state  -> known, reported to the user
+#   2. this configured value  -> known, reported to the user (an operator asserted it)
+#   3. prompt_context's DEFAULT_LOCATION -> weather only, NEVER reported as the user's location
+# A resident in an assisted-living facility is stationary, so (2) is the realistic source: it
+# needs no GPS permission, no per-turn geocode of a moving person, and cannot silently break
+# the way a browser permission prompt can.
+def _configured_location():
+    lat, lon = os.environ.get("ROBIN_LOCATION_LAT"), os.environ.get("ROBIN_LOCATION_LON")
+    if not (lat and lon):
+        return None
+    loc = _parse_location({"lat": lat, "lon": lon})
+    if loc and os.environ.get("ROBIN_LOCATION_NAME"):
+        loc["name"] = os.environ["ROBIN_LOCATION_NAME"]
+    return loc
+
+
+def _parse_location(data):
+    """-> {"lat": float, "lon": float} or None. Rejects non-numeric, NaN and out-of-range."""
+    try:
+        lat = float(data["lat"]); lon = float(data["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return {"lat": lat, "lon": lon}
+
+CONFIGURED_LOCATION = _configured_location()
+if CONFIGURED_LOCATION:
+    log.info("configured location: lat=%.2f lon=%.2f name=%s", CONFIGURED_LOCATION["lat"],
+             CONFIGURED_LOCATION["lon"], CONFIGURED_LOCATION.get("name", "<reverse-geocode>"))
+else:
+    log.info("no ROBIN_LOCATION_LAT/LON set — Robin will say it does not know the user's "
+             "location unless the device sends a location_state frame")
 
 SESSIONS = {}
 MAX_SESSIONS_KEPT = 200
@@ -284,12 +426,122 @@ def _session_disconnect(session_id):
 SESSION_WS = {}
 SESSION_LOCK = {}
 SESSION_HISTORY = {}
+# session string -> robin.ws.BoundSession: the profile snapshot (voice, speech_rate,
+# timezone, context) loaded once at connect, the server-minted session UUID, and the turn
+# counter. Everything persistence needs, keyed by the same in-memory session id as the rest.
+SESSION_DB = {}
 
 # Set by send_greet, consumed by the next turn_start in _run_tap: a user who was just spoken
 # to unprompted (rather than one who tapped the button themselves, already primed to speak)
 # needs a longer no-speech grace period before VAD gives up and re-idles.
 SESSION_GREET_PENDING = {}
 GREET_ARM_TIMEOUT_S = 20.0
+
+# --- Proactive delivery (POST /proactive): an external service pushes an utterance at one
+# device. It addresses the device by external_id -- the caller's own stable per-user id, the
+# same one robin_conversation.prompt_context keys profiles on -- because our session ids are
+# generated at connect and the caller has no way to know them. Devices declare theirs on the
+# existing `start` frame; SESSION_BY_EXTERNAL is an index into SESSIONS, not a second store.
+# Anything for a device with no live session waits in PROACTIVE_QUEUE for its next connect. ---
+SESSION_BY_EXTERNAL = {}                      # external_id -> session id (newest connect wins)
+PROACTIVE_QUEUE = {}                          # external_id -> deque of pending messages, oldest first
+PROACTIVE_QUEUE_MAX = 20                      # per device; overflow drops the OLDEST and says so
+# Retry dedupe. The caller retries on error AND its sensor layer re-fires on the same event,
+# so the same message_id arrives more than once; a repeat gets the first verdict back rather
+# than a second spoken utterance.
+PROACTIVE_SEEN = collections.OrderedDict()    # message_id -> (status, ts)
+PROACTIVE_SEEN_MAX = 512
+PROACTIVE_SEEN_TTL_S = 3600.0
+# The caller stamps delivery_by with the CURRENT time (payload built in send_msg_to_ca), so a
+# strict now > delivery_by test expires every message the instant it arrives. The grace window
+# is what makes the field behave as the deadline it is meant to be instead of a hard reject.
+DELIVERY_GRACE_S = 120.0
+
+
+def _seen_status(message_id):
+    """Status already returned for this message_id, or None. Evicts by TTL on the way past."""
+    if not message_id:
+        return None
+    now = time.time()
+    for mid, (_, ts) in list(PROACTIVE_SEEN.items()):   # oldest first; stop at the first live one
+        if now - ts <= PROACTIVE_SEEN_TTL_S:
+            break
+        PROACTIVE_SEEN.pop(mid, None)
+    rec = PROACTIVE_SEEN.get(message_id)
+    return rec[0] if rec else None
+
+
+def _remember_status(message_id, status):
+    """Record (and return) the verdict for a message_id, keeping the cache bounded."""
+    if message_id:
+        PROACTIVE_SEEN[message_id] = (status, time.time())
+        PROACTIVE_SEEN.move_to_end(message_id)
+        while len(PROACTIVE_SEEN) > PROACTIVE_SEEN_MAX:
+            PROACTIVE_SEEN.popitem(last=False)
+    return status
+
+
+def _is_expired(delivery_by, now=None):
+    """True once delivery_by is more than DELIVERY_GRACE_S in the past. Absent or unparseable
+    means no deadline: dropping a message over a malformed timestamp is worse than speaking
+    it a little late."""
+    if not delivery_by:
+        return False
+    try:
+        dt = datetime.datetime.fromisoformat(str(delivery_by).replace("Z", "+00:00"))
+    except ValueError:
+        log.warning("proactive: unparseable delivery_by %r -- treating as no deadline", delivery_by)
+        return False
+    if dt.tzinfo is None:                          # naive timestamp: the caller sends UTC
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return (now if now is not None else time.time()) > dt.timestamp() + DELIVERY_GRACE_S
+
+
+def _enqueue_proactive(external_id, msg):
+    """Hold a message for this device's next connect. Bounded per device; at the cap the
+    OLDEST is dropped, on the grounds that a stale nudge is the one worth losing."""
+    q = PROACTIVE_QUEUE.setdefault(external_id, collections.deque(maxlen=PROACTIVE_QUEUE_MAX))
+    if len(q) == PROACTIVE_QUEUE_MAX:
+        log.warning("proactive queue full for external_id=%s -- dropping oldest message_id=%s",
+                    external_id, q[0].get("message_id"))
+    q.append(msg)
+    log.info("proactive queued external_id=%s message_id=%s depth=%d",
+             external_id, msg.get("message_id"), len(q))
+
+
+def _bind_external(session_id, external_id):
+    """Record the device's own id on its existing session record and index it. Returns True
+    the first time a session declares one -- the caller then drains that device's queue."""
+    external_id = str(external_id or "").strip()
+    if not external_id or SESSIONS.get(session_id, {}).get("external_id") == external_id:
+        return False
+    if session_id in SESSIONS:
+        SESSIONS[session_id]["external_id"] = external_id
+    SESSION_BY_EXTERNAL[external_id] = session_id
+    log.info("session=%s bound external_id=%s", session_id, external_id)
+    return True
+
+
+def _proactive_targets():
+    """Every live session: one proactive message is spoken by every Robin that is listening.
+
+    This is the dashboard greet button without having to pick a session first, which is what
+    the deployment needs -- there is one Robin in the room, and no client sends an external_id
+    for it to be addressed by anyway. external_id stays the queue key and the log label, not
+    an address. The cost, deliberately accepted: with more than one device connected, a
+    message meant for one person is spoken in every room, so this wants revisiting before the
+    same server serves two patients at once."""
+    return list(SESSION_WS)
+
+
+def _bind_and_drain(session_id, external_id):
+    """Handle a `start` frame: record the device's id if it declared one (the dashboard and
+    the log are the only readers), then play whatever queued up while nothing was listening.
+    `start` is the device's own readiness signal, so it is the moment to drain. The drain runs
+    as its own task: it speaks for seconds and the socket's receive loop must keep reading
+    meanwhile, the same reason turns run via _spawn_turn rather than inline."""
+    _bind_external(session_id, external_id)
+    return asyncio.create_task(drain_proactive(session_id))
 
 
 @app.get("/health")
@@ -344,13 +596,87 @@ async def api_greet_session(session_id: str, request: Request):
     return {"status": "ok"}
 
 
-async def send_sentence(ws, sentence, reply_chunks, idx):
+@app.post("/proactive")
+async def api_proactive(request: Request):
+    """External service -> one utterance spoken on one device, addressed by external_id.
+
+    Body: service, message_id, external_id, utterance, message_type, severity, occurred_at,
+    delivery_by, require_affirmation, message. Unknown fields are ignored, and
+    require_affirmation is accepted but deliberately unused in this pass.
+
+    The utterance is spoken by EVERY live session, not one addressed by external_id (see
+    _proactive_targets); external_id is the queue key for messages that arrive while nothing
+    is listening, and the label they are logged under.
+
+    Always answers with the message_id and a status the caller can log, never a bare 200:
+      spoken  -- a live session heard it; the audio has been sent
+      queued  -- no live session, or the send died part way through; held for the next connect
+      expired -- delivery_by is more than DELIVERY_GRACE_S past; not spoken, not queued
+
+    Gated on the same shared key as the dashboard API (X-Robin-Key), because this is the one
+    route that puts words in Robin's mouth in someone's room: unauthenticated, anyone who can
+    reach the port could speak at any bound device, and probe which external_ids are live by
+    reading spoken vs queued back. The caller sends the key as a header for the same reason
+    the WebSocket does -- a query string persists the shared secret in nginx's access log."""
+    if not _check_http_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:                                   # noqa: BLE001 -- any malformed body
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+
+    message_id = str(body.get("message_id") or uuid.uuid4().hex)
+    external_id = str(body.get("external_id") or "").strip()
+    # `message` and `utterance` are the same string in the caller's payload; utterance is the
+    # one that is spoken, so prefer it and fall back rather than going silent on a typo.
+    utterance = str(body.get("utterance") or body.get("message") or "").strip()
+    if not utterance:
+        return JSONResponse({"message_id": message_id, "status": "rejected",
+                             "error": "utterance is empty"}, status_code=422)
+    if not external_id:                                 # nothing to address, nothing to queue under
+        return JSONResponse({"message_id": message_id, "status": "rejected",
+                             "error": "external_id is required"}, status_code=422)
+
+    prior = _seen_status(message_id)
+    if prior is not None:
+        log.info("proactive duplicate message_id=%s -> %s", message_id, prior)
+        return {"message_id": message_id, "status": prior, "duplicate": True}
+
+    msg = {"message_id": message_id, "external_id": external_id, "utterance": utterance,
+           "service": body.get("service"), "message_type": body.get("message_type"),
+           "severity": body.get("severity"), "occurred_at": body.get("occurred_at"),
+           "delivery_by": body.get("delivery_by"),
+           "require_affirmation": bool(body.get("require_affirmation")),   # accepted, unused
+           "received_at": time.time()}
+
+    if _is_expired(msg["delivery_by"]):
+        log.info("proactive expired external_id=%s message_id=%s delivery_by=%s",
+                 external_id, message_id, msg["delivery_by"])
+        return {"message_id": message_id, "status": _remember_status(message_id, "expired")}
+
+    heard = []
+    for session_id in _proactive_targets():
+        try:
+            if await deliver_proactive(session_id, msg):
+                heard.append(session_id)
+        except Exception as e:      # noqa: BLE001 -- socket died mid-utterance: it was NOT heard
+            log.warning("proactive send failed session=%s message_id=%s: %r", session_id, message_id, e)
+    if heard:                       # one session hearing it is delivery; the rest are logged above
+        return {"message_id": message_id,
+                "status": _remember_status(message_id, "spoken"), "sessions": heard}
+    _enqueue_proactive(external_id, msg)
+    return {"message_id": message_id, "status": _remember_status(message_id, "queued")}
+
+
+async def send_sentence(ws, sentence, reply_chunks, idx, *, voice=VOICE, speed=1.0):
     """Synthesize one sentence, send the audio frame, accumulate for the saved reply wav.
     An `audio_meta` control message is sent immediately before the binary frame so the client
     can pair server-side send timing with each chunk. Returns synth seconds."""
     await ws.send_json({"type": "reply", "text": sentence})
     t = time.perf_counter()
-    audio = await asyncio.to_thread(synth_audio, sentence)
+    audio = await asyncio.to_thread(synth_audio, sentence, voice, speed)
     dt = time.perf_counter() - t
     reply_chunks.append(audio)
     data = wav_bytes(audio)
@@ -370,6 +696,39 @@ def save_reply(reply_chunks, tid):
 
 
 _SENT_RE = re.compile(r"(?<=[.!?])\s+")
+
+# STT on a clip that was only room noise comes back empty or as a bare filler ("mm", "uh").
+# Those used to be routed like any other turn, so the LLM answered the silence -- "Is there
+# something on your mind? I'm here to listen." -- an entire unasked-for spoken turn, most
+# jarring right after a goodbye, where it reads as Robin refusing to leave. There is nothing
+# to reply to: report an empty transcript and end the turn without speaking.
+_NOISE_ONLY = re.compile(r"^[\W_]*(m+|h+m+|u+h+|u+m+|a+h+|e+h+|h+u+h+)?[\W_]*$", re.IGNORECASE)
+
+
+def is_noise_transcript(text):
+    return bool(_NOISE_ONLY.match(text or ""))
+
+
+def _profile_process_turn(history, transcript, bound, *, clock_state, location_coordinates):
+    """process_turn with the connection's DB profile injected. Runs in a worker thread.
+
+    The prompt context is prebuilt here so `personal_data_profile` comes from the profile
+    row's jsonb `context` (loaded once at connect) instead of prompt_context's legacy
+    profiles/<id>.json file lookup, and so the temporal context uses the profile's IANA
+    timezone. clock_state still goes to process_turn, which merges it into the context."""
+    context = None
+    user_id = "user"
+    if bound is not None:
+        user_id = str(bound.profile_id)
+        try:
+            tz = ZoneInfo(bound.timezone)
+        except Exception:                           # bad tz name must not kill the turn
+            tz = None
+        context = build_conversation_prompt_context(user_id, location_coordinates=location_coordinates,
+                                                    tz=tz)
+        context["personal_data_profile"] = json.dumps(bound.context)
+    return process_turn(history, transcript, user_id=user_id, context=context,
+                        clock_state=clock_state, location_coordinates=location_coordinates)
 
 
 async def robin_reply(ws, history, transcript, turn_id, user_id):
@@ -392,12 +751,16 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
     lock = SESSION_LOCK.get(user_id)
     if lock is None:                             # session torn down mid-turn; keep talking
         lock = SESSION_LOCK[user_id] = asyncio.Lock()
+    bound = SESSION_DB.get(user_id)              # profile snapshot; None only for greet races
+    voice = bound.voice if bound else VOICE
+    speed = bound.speech_rate if bound else 1.0
     async with lock:
         await ws.send_json({"type": "turn_start", "turn_id": turn_id})
         t_llm = time.perf_counter()
         result = await asyncio.to_thread(
-            functools.partial(process_turn, history, transcript, user_id=user_id,
-                              clock_state=SESSION_CLOCK.get(user_id)))
+            functools.partial(_profile_process_turn, history, transcript, bound,
+                              clock_state=SESSION_CLOCK.get(user_id),
+                              location_coordinates=SESSION_LOCATION.get(user_id) or CONFIGURED_LOCATION))
         llm_dt = time.perf_counter() - t_llm
         reply = result["reply"]
         should_end = bool(result.get("should_end_session"))
@@ -431,7 +794,8 @@ async def robin_reply(ws, history, transcript, turn_id, user_id):
                 continue
             if ttfs is None:
                 ttfs = time.perf_counter() - t_llm
-            tts_total += await send_sentence(ws, sentence, reply_chunks, idx)
+            tts_total += await send_sentence(ws, sentence, reply_chunks, idx,
+                                             voice=voice, speed=speed)
             idx += 1
         # If Robin just ASKED something, the user needs thinking time before answering.
         # Reuse the greet path's longer arm window: live, "What time should that alarm go
@@ -472,33 +836,122 @@ async def _await_cancel_result(user_id, result, turn_id):
 GREET_TEXT = "How is your day going?"
 
 
-async def send_greet(session_id, text=GREET_TEXT):
-    """Speak `text` unprompted into an already-connected tap session, exactly as a normal
-    reply would (turn_start / reply / audio_meta / done) -- indistinguishable to the client
-    from a real turn. The client's own auto-continue (tap_index.html's rearm(), fired on
-    `done`) then re-sends {type: "turn_start"}, which is what actually arms VAD on the
-    server; nothing here has to poke the VAD state machine directly. Returns False if the
-    session has no live socket (already disconnected)."""
+async def _speak_unprompted(session_id, text, tid, *, chime=False, suppress=False):
+    """Speak `text` unprompted into an already-connected session, exactly as a normal reply
+    would (turn_start / reply / audio_meta / done) -- indistinguishable to the client from a
+    real turn. The client's own auto-continue (tap_index.html's rearm(), fired on `done`)
+    then re-sends {type: "turn_start"}, which is what actually arms VAD on the server;
+    nothing here has to poke the VAD state machine directly.
+
+    Shared by send_greet and deliver_proactive, and the synthesis itself is send_sentence --
+    the same TTS path every ordinary reply goes through, so there is exactly one.
+
+    `suppress` brackets the utterance in listen_suppress / listen_resume control frames, so a
+    device that runs its own wake word or onset detection can stand down while Robin speaks
+    and re-arm afterwards instead of hearing Robin's own voice as a user turn. `chime` plays
+    CHIME_PATH first, as an ordinary audio frame.
+
+    Returns False if the session has no live socket (already disconnected), and RAISES if the
+    socket dies mid-utterance -- a caller that must know whether the user actually heard this
+    has to treat that as undelivered."""
     ws = SESSION_WS.get(session_id)
     if ws is None:
         return False
+    bound = SESSION_DB.get(session_id)
+    voice = bound.voice if bound else VOICE
+    speed = bound.speech_rate if bound else 1.0
     async with SESSION_LOCK.setdefault(session_id, asyncio.Lock()):
-        tid = f"{session_id}_greet{int(time.time())}"
         await ws.send_json({"type": "turn_start", "turn_id": tid})
+        if suppress:
+            await ws.send_json({"type": "listen_suppress", "reason": "proactive", "turn_id": tid})
         reply_chunks, idx = [], 0
+        if chime and await send_chime(ws, idx):
+            idx += 1
         for sentence in _SENT_RE.split(text.strip()):
             sentence = sentence.strip()
             if sentence:
-                await send_sentence(ws, sentence, reply_chunks, idx)
+                await send_sentence(ws, sentence, reply_chunks, idx, voice=voice, speed=speed)
                 idx += 1
+        if suppress:
+            await ws.send_json({"type": "listen_resume", "reason": "proactive", "turn_id": tid})
         await ws.send_json({"type": "done", "ending": False})
+    await persist_turn(bound, role="assistant", content=text, source="proactive",
+                       meta={"tid": tid, "chime": chime})
     SESSION_GREET_PENDING[session_id] = True                             # longer arm timeout
     history = SESSION_HISTORY.get(session_id)                            # for the rearm this
     if history is not None:                                              # triggers
         history.append({"role": "assistant", "content": text})           # so the next real
-    _session_turn(session_id, f"[Robin, unprompted] {text}")             # LLM turn has context
+    return True                                                          # LLM turn has context
+
+
+async def send_chime(ws, idx):
+    """Send the chime as an ordinary audio frame (audio_meta + binary), identical in shape to
+    a spoken sentence, so the client's existing sequential playback queues it straight ahead
+    of the speech. False when the chime could not be decoded -- never a reason not to speak."""
+    audio = chime_audio()
+    if audio is None:
+        return False
+    data = wav_bytes(audio)
+    await ws.send_json({"type": "audio_meta", "idx": idx, "server_send_ts": time.perf_counter(),
+                        "bytes": len(data), "sample_rate": 24000, "chime": True})
+    await ws.send_bytes(data)
+    return True
+
+
+async def send_greet(session_id, text=GREET_TEXT):
+    """Dashboard greet: speak `text` into a live tap session. See _speak_unprompted."""
+    if not await _speak_unprompted(session_id, text, f"{session_id}_greet{int(time.time())}"):
+        return False
+    _session_turn(session_id, f"[Robin, unprompted] {text}")
     log.info("greet  session=%s  %r", session_id, text)
     return True
+
+
+async def deliver_proactive(session_id, msg):
+    """Speak one proactive message into a live session: chime, then the utterance, bracketed
+    by the listen_suppress / listen_resume frames. False if the socket is already gone;
+    RAISES if it dies mid-utterance, so the caller can requeue rather than claim delivery."""
+    utterance = msg["utterance"]
+    tid = f"{session_id}_proactive{int(time.time())}"
+    if not await _speak_unprompted(session_id, utterance, tid, chime=True, suppress=True):
+        return False
+    _session_turn(session_id, f"[Robin, proactive] {utterance}")
+    log.info("proactive spoken session=%s external_id=%s message_id=%s service=%s type=%s %r",
+             session_id, msg.get("external_id"), msg.get("message_id"),
+             msg.get("service"), msg.get("message_type"), utterance)
+    return True
+
+
+async def drain_proactive(session_id):
+    """Play what is waiting into a session that has just declared itself ready, oldest first.
+
+    Every queue, not one: delivery is to whoever is listening (see _proactive_targets), so the
+    external_id a message was filed under does not decide who hears it. Expired messages are
+    skipped, logged, never spoken. The first failure stops the drain with the message put BACK
+    at the head of its queue, so a socket that dies halfway through costs nothing but the
+    delay -- and each message is popped before it is spoken, so two `start` frames racing
+    cannot speak the same message twice."""
+    for key in list(PROACTIVE_QUEUE):
+        q = PROACTIVE_QUEUE.get(key)
+        if not q:
+            continue
+        log.info("proactive drain session=%s external_id=%s depth=%d", session_id, key, len(q))
+        while q:
+            msg = q.popleft()                     # popped first: a racing drain cannot re-speak it
+            if _is_expired(msg["delivery_by"]):
+                _remember_status(msg["message_id"], "expired")
+                log.info("proactive drain: skipped expired message_id=%s", msg["message_id"])
+                continue
+            try:
+                if not await deliver_proactive(session_id, msg):
+                    q.appendleft(msg)             # socket already gone: put it back, in order
+                    return
+            except Exception as e:                # noqa: BLE001 -- died mid-utterance; do not lose it
+                q.appendleft(msg)
+                log.warning("proactive drain stopped at message_id=%s: %r", msg["message_id"], e)
+                return
+            _remember_status(msg["message_id"], "spoken")
+        PROACTIVE_QUEUE.pop(key, None)            # drained: don't accumulate dead device ids
 
 
 def _append_telemetry(session, obj):
@@ -513,23 +966,25 @@ def _append_telemetry(session, obj):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
-    if not _check_auth(ws):
-        log.warning("rejected /ws connection from %s: bad or missing key", _client_ip(ws))
-        # Completing the handshake (accept) then immediately closing is what actually
-        # delivers code 1008 to the browser -- closing before accept fails the handshake
-        # itself (HTTP 403), which browsers surface as code 1006, not 1008. No GPU work
-        # happens either way: we return before ever reading a message.
-        await ws.accept()
-        await ws.close(code=1008)
+    # Device-token auth (robin.ws): the token rides the Sec-WebSocket-Protocol header the
+    # same way the old shared key did, is verified against its stored SHA-256, must be
+    # kind='device', and resolves the profile server-side. Rejection is accept-then-close
+    # (see bind_device_session) with code 4401. The old ROBIN_API_KEY no longer grants
+    # voice-socket access.
+    bound = await bind_device_session(ws)
+    if bound is None:
+        log.warning("rejected /ws connection from %s: bad, revoked, or non-device token",
+                    _client_ip(ws))
         return
-    await ws.accept(subprotocol=API_KEY)
     session = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"   # suffix: second resolution alone collides
-    log.info("ws connected  session=%s", session)
+    log.info("ws connected  session=%s profile=%d db_session=%s", session, bound.profile_id,
+             bound.session_id)
     _session_connect(session, "classic", _client_ip(ws))
     history = []                                              # per-connection conversation memory
     SESSION_WS[session] = ws
     SESSION_LOCK[session] = asyncio.Lock()
     SESSION_HISTORY[session] = history
+    SESSION_DB[session] = bound
     turn = 0
     try:
         while True:
@@ -561,8 +1016,19 @@ async def ws_endpoint(ws: WebSocket):
             _session_turn(session, transcript)
             await ws.send_json({"type": "transcript", "text": transcript})
 
+            if is_noise_transcript(transcript):
+                log.info("turn %d  noise-only transcript %r -- no reply", turn, transcript)
+                await ws.send_json({"type": "done", "ending": False})
+                continue
+
+            await persist_turn(bound, role="user", content=transcript,
+                               meta={"tid": tid, "stt_s": round(stt_dt, 3),
+                                     "audio_s": round(dur, 2)})
             full, reply_chunks, ttft, ttfs, tts_total, llm_dt, ending = await robin_reply(
                 ws, history, transcript, tid, session)
+            await persist_turn(bound, role="assistant", content=full.strip(),
+                               meta={"tid": tid, "model": MODEL, "backend": ARGS.backend,
+                                     "llm_s": round(llm_dt, 2), "tts_s": round(tts_total, 2)})
 
             reply_wav = save_reply(reply_chunks, tid)
             turn_total = time.perf_counter() - t_turn
@@ -578,7 +1044,9 @@ async def ws_endpoint(ws: WebSocket):
         SESSION_WS.pop(session, None)
         SESSION_LOCK.pop(session, None)
         SESSION_HISTORY.pop(session, None)
+        SESSION_DB.pop(session, None)
         SESSION_CLOCK.pop(session, None)
+        SESSION_LOCATION.pop(session, None)
         SESSION_CANCEL_WAITER.pop(session, None)
 
 
@@ -637,11 +1105,31 @@ async def _finalize_turn(ws, session, audio16k, sr, history, tid, stages):
              stages["t_stt_final"] - t, len(audio16k) / sr, transcript)
     await ws.send_json({"type": "transcript", "text": transcript})
 
+    if is_noise_transcript(transcript):
+        log.info("turn %s  noise-only transcript %r -- no reply", tid, transcript)
+        await ws.send_json({"type": "done", "ending": False})
+        return
+
+    bound = SESSION_DB.get(session)
+    user_meta = {"tid": tid, "stt_s": round(stages["t_stt_final"] - t, 3),
+                 "audio_s": round(len(audio16k) / sr, 2)}
+    if stages.get("vad_speech_duration_ms") is not None:
+        user_meta["vad_speech_ms"] = stages["vad_speech_duration_ms"]
+    await persist_turn(bound, role="user", content=transcript, meta=user_meta)
+
     t_reply = time.perf_counter()
     full, reply_chunks, ttft, ttfs, tts_total, llm_dt, ending = await robin_reply(
         ws, history, transcript, tid, session)
     stages["t_llm_first_token"] = (t_reply + ttft) if ttft is not None else None
     stages["t_tts_first_frame"] = (t_reply + ttfs) if ttfs is not None else None
+
+    # latency_ms is the spec's definition: end of user speech (VAD EOU) to start of TTS.
+    latency_ms = None
+    if stages.get("t_eou") is not None and stages.get("t_tts_first_frame") is not None:
+        latency_ms = int((stages["t_tts_first_frame"] - stages["t_eou"]) * 1000)
+    await persist_turn(bound, role="assistant", content=full.strip(), latency_ms=latency_ms,
+                       meta={"tid": tid, "model": MODEL, "backend": ARGS.backend,
+                             "llm_s": round(llm_dt, 2), "tts_s": round(tts_total, 2)})
 
     reply_wav = save_reply(reply_chunks, tid)
     log.info("turn %s  reply (tts=%.2f llm=%.2f) %r -> %s", tid, tts_total, llm_dt, full.strip(), reply_wav)
@@ -658,32 +1146,38 @@ async def ws_stream_endpoint(ws: WebSocket):
     """Tap-to-talk (VAD endpointing) or hold-to-talk, per config.turn_mode(). Both reuse the
     resident models and the shared reply/finalize path; only turn-boundary detection differs.
     turn_mode='hold' is the latency-matrix control that isolates VAD hangover from the pipeline."""
-    if not _check_auth(ws):
-        log.warning("rejected /ws-stream connection from %s: bad or missing key", _client_ip(ws))
-        # See ws_endpoint's comment: accept-then-close is what actually delivers 1008 to
-        # the browser. No GPU work happens either way -- we return before reading a message.
-        await ws.accept()
-        await ws.close(code=1008)
+    # Same device-token auth as /ws (see ws_endpoint): profile resolved from the token,
+    # never from anything the client sends; failure closes with 4401.
+    bound = await bind_device_session(ws)
+    if bound is None:
+        log.warning("rejected /ws-stream connection from %s: bad, revoked, or non-device token",
+                    _client_ip(ws))
         return
-    await ws.accept(subprotocol=API_KEY)
     session = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}"   # suffix: second resolution alone collides
-    log.info("ws-stream connected  session=%s  turn_mode=%s", session, TURN_MODE)
+    log.info("ws-stream connected  session=%s profile=%d db_session=%s turn_mode=%s",
+             session, bound.profile_id, bound.session_id, TURN_MODE)
     _session_connect(session, TURN_MODE, _client_ip(ws))
     history = []                                              # per-connection conversation memory
     SESSION_WS[session] = ws
     SESSION_LOCK[session] = asyncio.Lock()
     SESSION_HISTORY[session] = history
+    SESSION_DB[session] = bound
     try:
         if TURN_MODE == "tap":
             await _run_tap(ws, session, history)
         else:
             await _run_hold(ws, session, history)
     finally:
+        ext = SESSIONS.get(session, {}).get("external_id")
+        if ext and SESSION_BY_EXTERNAL.get(ext) == session:   # a reconnect may already own it
+            SESSION_BY_EXTERNAL.pop(ext, None)
         _session_disconnect(session)
         SESSION_WS.pop(session, None)
         SESSION_LOCK.pop(session, None)
         SESSION_HISTORY.pop(session, None)
+        SESSION_DB.pop(session, None)
         SESSION_CLOCK.pop(session, None)
+        SESSION_LOCATION.pop(session, None)
         SESSION_CANCEL_WAITER.pop(session, None)
         SESSION_GREET_PENDING.pop(session, None)
 
@@ -706,10 +1200,24 @@ async def _run_hold(ws, session, history):
                     sr = int(data.get("sampleRate", 16000))
                     buf, n_samples, last_partial = [], 0, 0
                     t_turn_start = time.perf_counter()
+                    # The device names itself here; this is also its readiness signal, so
+                    # anything queued for it while it was away plays now (see _bind_and_drain).
+                    _bind_and_drain(session, data.get("external_id"))
                 elif typ == "cancel_result":
                     waiter = SESSION_CANCEL_WAITER.get(session)
                     if waiter is not None and not waiter.done():
                         waiter.set_result(data)
+                elif typ == "location_state":
+                    loc = _parse_location(data)
+                    if loc is None:
+                        log.warning("location_state session=%s rejected (bad coords: %r)",
+                                    session, {k: data.get(k) for k in ("lat", "lon")})
+                    else:
+                        SESSION_LOCATION[session] = loc
+                        # Coarse in the log on purpose: 2 dp is ~1 km, enough to debug "is it
+                        # using the right city" without writing a precise home address to disk.
+                        log.info("location_state session=%s lat=%.2f lon=%.2f source=%s",
+                                 session, loc["lat"], loc["lon"], data.get("source", "?"))
                 elif typ == "clock_state":
                     # Full snapshot from the device; replaces whatever we had.
                     SESSION_CLOCK[session] = data
@@ -779,10 +1287,24 @@ async def _run_tap(ws, session, history):
                 if typ == "start":
                     sr = int(data.get("sampleRate", 16000))
                     ingest = VadIngest(vad, params, sr)
+                    # The device names itself here; this is also its readiness signal, so
+                    # anything queued for it while it was away plays now (see _bind_and_drain).
+                    _bind_and_drain(session, data.get("external_id"))
                 elif typ == "cancel_result":
                     waiter = SESSION_CANCEL_WAITER.get(session)
                     if waiter is not None and not waiter.done():
                         waiter.set_result(data)
+                elif typ == "location_state":
+                    loc = _parse_location(data)
+                    if loc is None:
+                        log.warning("location_state session=%s rejected (bad coords: %r)",
+                                    session, {k: data.get(k) for k in ("lat", "lon")})
+                    else:
+                        SESSION_LOCATION[session] = loc
+                        # Coarse in the log on purpose: 2 dp is ~1 km, enough to debug "is it
+                        # using the right city" without writing a precise home address to disk.
+                        log.info("location_state session=%s lat=%.2f lon=%.2f source=%s",
+                                 session, loc["lat"], loc["lon"], data.get("source", "?"))
                 elif typ == "clock_state":
                     # Full snapshot from the device; replaces whatever we had.
                     SESSION_CLOCK[session] = data
