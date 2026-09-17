@@ -11,3 +11,4 @@ in/
 __pycache__/
 *.pyc
 *.pyo
+DEV_LOGIN.md

@@ -59,6 +59,7 @@ export default function ActivitiesPage() {
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
   const [activeTab, setActiveTab] = useState<ChartTab>('sessions')
+  const [includeDiagnostic, setIncludeDiagnostic] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
 
@@ -91,6 +92,7 @@ export default function ActivitiesPage() {
     try {
       setActivity(
         await fetchActivity(profileId, {
+          include_diagnostic: includeDiagnostic,
           ...(dateFrom ? { date_from: dateFrom } : {}),
           ...(dateTo ? { date_to: dateTo } : {})
         })
@@ -113,7 +115,7 @@ export default function ActivitiesPage() {
     if (!selectedProfileId) return
     void loadActivity(selectedProfileId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedProfileId, dateFrom, dateTo])
+  }, [selectedProfileId, dateFrom, dateTo, includeDiagnostic])
 
   useEffect(() => {
     if (!canUseStorage()) return
@@ -239,6 +241,14 @@ export default function ActivitiesPage() {
                 type="date"
                 value={dateTo}
               />
+            </label>
+            <label className="auth-checkbox">
+              <input
+                checked={includeDiagnostic}
+                onChange={(event) => setIncludeDiagnostic(event.target.checked)}
+                type="checkbox"
+              />
+              <span>Show diagnostics</span>
             </label>
             <div className="filter-actions">
               <button className="filter-clear-button" onClick={handleClearRange} type="button">

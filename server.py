@@ -9,6 +9,7 @@ also run in threads to keep the event loop free.
 """
 import math
 import os
+import sys
 
 import config   # importing sets PYTORCH_CUDA_ALLOC_CONF before torch loads (see config.py)
 
@@ -140,6 +141,7 @@ from zoneinfo import ZoneInfo
 # Persistence layer (robin/): profile-bound device tokens and per-utterance turn rows.
 # Import is light -- engine creation (and the DATABASE_URL requirement) is deferred until
 # the first connection actually authenticates.
+from robin.wake import offer_wake_model, send_wake_model
 from robin.ws import bind_device_session, persist_turn
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 log.info("[ready] STT %.1fs · TTS %.1fs · both resident on %s · LLM=%s [%s] · logs -> %s",
@@ -290,12 +292,81 @@ app.add_middleware(
 # Dashboard HTTP API: /auth/* (login/logout) and /profiles/* (list, detail, patch, turns),
 # authenticated by per-account Bearer tokens -- separate from the legacy X-Robin-Key gate on
 # the pre-existing endpoints below.
+from fastapi import Depends as _Depends                          # noqa: E402
+from fastapi.responses import Response as _Response              # noqa: E402
 from robin.api.admin import router as _robin_admin_router        # noqa: E402
 from robin.api.auth import router as _robin_auth_router          # noqa: E402
 from robin.api.profiles import router as _robin_profiles_router  # noqa: E402
+from robin.api.wake import router as _robin_wake_router          # noqa: E402
+from robin.api.wake import device_router as _robin_wake_device_router  # noqa: E402
+from robin.api.wake import set_transcriber as _set_wake_transcriber  # noqa: E402
+from robin.api.wake import set_wake_scorer as _set_wake_scorer   # noqa: E402
+from robin.train import OWW_ROOT as _OWW_ROOT                    # noqa: E402
+from robin.auth.deps import require_dashboard as _require_dashboard  # noqa: E402
 app.include_router(_robin_auth_router)
 app.include_router(_robin_profiles_router)
 app.include_router(_robin_admin_router)
+app.include_router(_robin_wake_router)
+app.include_router(_robin_wake_device_router)
+# Enrollment takes are content-checked with the same resident STT the voice turns use:
+# a "Hey Robin" take that doesn't transcribe as the wake word is rejected at upload.
+_set_wake_transcriber(stt_transcribe)
+
+# Second gate: the shared base wake head itself. STT decodes speech far too degraded
+# for the 50k-parameter detector (Margaret's first enrollment: 3 of 7 STT-approved
+# takes scored ~0.0 and poisoned training), so a positive must also register on the
+# model that will actually run on the tablet. Lazy-loaded from the oww-train checkout;
+# missing files just disable this gate with a warning rather than blocking startup.
+_WAKE_SCORE_LOCK = threading.Lock()
+_wake_score_model = None
+_WAKE_BASE_ONNX = os.environ.get(
+    "ROBIN_WAKE_BASE_MODEL",
+    os.path.join(_OWW_ROOT, "lora/rank_sweep/hey_robin_om_r8_avg9.onnx"))
+
+
+def _wake_score(wav_path):
+    global _wake_score_model
+    with _WAKE_SCORE_LOCK:                      # openwakeword.Model is not thread-safe
+        if _wake_score_model is None:
+            sys.path.insert(0, os.path.join(_OWW_ROOT, "openWakeWord"))
+            import openwakeword.model
+            _wake_score_model = openwakeword.model.Model(
+                wakeword_models=[_WAKE_BASE_ONNX], inference_framework="onnx")
+        _wake_score_model.reset()
+        return max(list(x.values())[0]
+                   for x in _wake_score_model.predict_clip(wav_path))
+
+
+if os.path.exists(_WAKE_BASE_ONNX):
+    _set_wake_scorer(_wake_score)
+else:
+    log.warning("wake-score gate disabled: base model not found at %s", _WAKE_BASE_ONNX)
+
+# Voice previews for the dashboard's profile form. Lives here, not in robin/api/: the
+# robin package must stay importable without the TTS models this endpoint needs.
+_VOICE_PREVIEW_TEXT = "Hello! I'm Robin. This is how I would sound."
+_VOICE_PREVIEW_RE = re.compile(r"^[a-z]{2}_[a-z]+$")
+_VOICE_PREVIEW_CACHE = {}    # voice id -> WAV bytes; synthesis (and a possible voice-file
+                             # download) happens once per voice per process
+
+
+@app.get("/voices/{voice_id}/preview")
+async def voice_preview(voice_id: str, account=_Depends(_require_dashboard)):
+    if not _VOICE_PREVIEW_RE.match(voice_id):
+        return JSONResponse({"detail": "not a voice id"}, status_code=422)
+    wav = _VOICE_PREVIEW_CACHE.get(voice_id)
+    if wav is None:
+        try:
+            # Off the event loop: synth blocks on _TTS_LOCK and the GPU, and an uncached
+            # voice first downloads its weights from Hugging Face.
+            audio = await asyncio.to_thread(synth_audio, _VOICE_PREVIEW_TEXT, voice_id, 1.0)
+        except Exception as e:                     # noqa: BLE001 -- unknown voice, offline HF, ...
+            log.warning("voice preview failed for %r: %s", voice_id, e)
+            return JSONResponse({"detail": f"could not synthesize voice {voice_id!r}"},
+                                status_code=404)
+        wav = _VOICE_PREVIEW_CACHE[voice_id] = wav_bytes(audio)
+    return _Response(content=wav, media_type="audio/wav",
+                     headers={"Cache-Control": "private, max-age=86400"})
 
 
 def _client_ip(ws: WebSocket) -> str:
@@ -985,6 +1056,8 @@ async def ws_endpoint(ws: WebSocket):
     SESSION_LOCK[session] = asyncio.Lock()
     SESSION_HISTORY[session] = history
     SESSION_DB[session] = bound
+    async with SESSION_LOCK[session]:   # a concurrent greet must not interleave audio
+        await offer_wake_model(ws, bound)   # between the wake meta frame and its blob
     turn = 0
     try:
         while True:
@@ -996,6 +1069,9 @@ async def ws_endpoint(ws: WebSocket):
                 if data.get("type") == "client_telemetry":
                     # fire-and-forget: never block the next turn's audio on a disk write
                     asyncio.create_task(asyncio.to_thread(_append_telemetry, session, data))
+                elif data.get("type") == "wake_model_fetch":
+                    async with SESSION_LOCK[session]:
+                        await send_wake_model(ws, bound)
                 continue
             if msg.get("bytes") is None:
                 continue
@@ -1162,6 +1238,8 @@ async def ws_stream_endpoint(ws: WebSocket):
     SESSION_LOCK[session] = asyncio.Lock()
     SESSION_HISTORY[session] = history
     SESSION_DB[session] = bound
+    async with SESSION_LOCK[session]:   # a concurrent greet must not interleave audio
+        await offer_wake_model(ws, bound)   # between the wake meta frame and its blob
     try:
         if TURN_MODE == "tap":
             await _run_tap(ws, session, history)
@@ -1228,6 +1306,9 @@ async def _run_hold(ws, session, history):
                              [{k: a.get(k) for k in ("id", "hour", "minutes", "days", "label")}
                               for a in (data.get("alarms") or [])],
                              bool(data.get("ringing")))
+                elif typ == "wake_model_fetch":
+                    async with SESSION_LOCK[session]:
+                        await send_wake_model(ws, SESSION_DB.get(session))
                 elif typ == "end":
                     turn += 1
                     tid = f"{session}_t{turn:02d}"
@@ -1315,6 +1396,9 @@ async def _run_tap(ws, session, history):
                              [{k: a.get(k) for k in ("id", "hour", "minutes", "days", "label")}
                               for a in (data.get("alarms") or [])],
                              bool(data.get("ringing")))
+                elif typ == "wake_model_fetch":
+                    async with SESSION_LOCK[session]:
+                        await send_wake_model(ws, SESSION_DB.get(session))
                 elif typ == "turn_start":
                     if ingest is None:
                         ingest = VadIngest(vad, params, sr)

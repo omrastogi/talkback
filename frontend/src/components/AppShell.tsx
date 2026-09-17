@@ -7,7 +7,10 @@ import { clearStoredSession } from "../lib/auth";
 
 const NAV_LINKS = [
   { href: "/", label: "Chats" },
-  { href: "/users", label: "Users", adminOnly: true },
+  { href: "/live", label: "Live" },
+  { href: "/enroll", label: "Wake Word" },
+  { href: "/users", label: "Profiles", adminOnly: true },
+  { href: "/accounts", label: "Accounts", adminOnly: true },
   { href: "/activities", label: "Activities" },
 ];
 

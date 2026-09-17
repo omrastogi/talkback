@@ -271,3 +271,46 @@ def test_activity_buckets_days_in_profile_timezone(client):
     assert client.get(f"/profiles/{pid}/activity",
                       params={"date_from": "2026-07-02", "date_to": "2026-07-01"},
                       headers=_auth(raw)).status_code == 422
+
+
+def test_diagnostic_sessions_hidden_by_default(client):
+    """Turns from a device token labeled 'diagnostic…' (the dashboard Live page) stay out
+    of sessions/turns/activity unless include_diagnostic=true. Turns with no token
+    provenance (pre-migration rows) count as real data."""
+    aid = _run(make_account())
+    pid = _run(make_profile())
+    _run(link(aid, pid))
+    raw, _ = _run(dashboard_token(aid))
+    _, tablet_tid = _run(device_token(pid, label="Tab A9 living room"))
+    _, diag_tid = _run(device_token(pid, label="diagnostic: browser — admin@example.org"))
+    sid_real, sid_diag, sid_legacy = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    async def seed():
+        async with rdb._sessionmaker() as s:
+            for sid, token_id in ((sid_real, tablet_tid), (sid_diag, diag_tid),
+                                  (sid_legacy, None)):
+                s.add(ConversationTurn(profile_id=pid, session_id=sid, turn_index=0,
+                                       role="user", content="hi", auth_token_id=token_id))
+            await s.commit()
+    _run(seed())
+
+    sessions = client.get(f"/profiles/{pid}/sessions",
+                          headers=_auth(raw)).json()["sessions"]
+    assert {s["session_id"] for s in sessions} == {str(sid_real), str(sid_legacy)}
+    sessions = client.get(f"/profiles/{pid}/sessions",
+                          params={"include_diagnostic": "true"},
+                          headers=_auth(raw)).json()["sessions"]
+    assert len(sessions) == 3
+
+    turns = client.get(f"/profiles/{pid}/turns", headers=_auth(raw)).json()["turns"]
+    assert {t["session_id"] for t in turns} == {str(sid_real), str(sid_legacy)}
+    turns = client.get(f"/profiles/{pid}/turns", params={"include_diagnostic": "true"},
+                       headers=_auth(raw)).json()["turns"]
+    assert len(turns) == 3
+
+    activity = client.get(f"/profiles/{pid}/activity", headers=_auth(raw)).json()
+    assert sum(d["sessions"] for d in activity["days"]) == 2
+    activity = client.get(f"/profiles/{pid}/activity",
+                          params={"include_diagnostic": "true"},
+                          headers=_auth(raw)).json()
+    assert sum(d["sessions"] for d in activity["days"]) == 3

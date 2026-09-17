@@ -35,6 +35,21 @@ async def require_dashboard(request: Request,
     return account
 
 
+async def require_device_profile(request: Request,
+                                 session: AsyncSession = Depends(get_session)) -> Profile:
+    """Authorization: Bearer <device token> -> the bound active Profile, or 401.
+
+    The HTTP twin of authenticate_device_ws, for the tablet's own enrollment calls: the
+    token's binding fixes the profile — nothing the client sends can select another."""
+    token = await verify_token(session, _bearer(request), kind="device")
+    if token is None:
+        raise HTTPException(status_code=401, detail="invalid or revoked token")
+    profile = await session.get(Profile, token.profile_id)
+    if profile is None or not profile.active:
+        raise HTTPException(status_code=401, detail="invalid or revoked token")
+    return profile
+
+
 async def require_admin(account: Account = Depends(require_dashboard)) -> Account:
     """require_dashboard plus is_admin. 403, not 404: admin routes' existence is public
     (the 404-not-403 rule protects profile existence, not route existence)."""
@@ -61,13 +76,14 @@ def ws_presented_token(ws: WebSocket) -> str:
     return ws.headers.get("sec-websocket-protocol", "").strip()
 
 
-async def authenticate_device_ws(raw_token: str) -> Profile | None:
-    """Voice-socket auth: raw token -> the bound, active Profile, else None.
+async def authenticate_device_ws(raw_token: str) -> tuple[Profile, AuthToken] | None:
+    """Voice-socket auth: raw token -> (bound active Profile, the token row), else None.
 
     Rules, in order: the token must exist and be unrevoked; it must be kind='device' (a
     dashboard token is not valid for the voice socket); its profile must exist and be
     active. profile_id comes from the token row alone — nothing the client sends can
-    select a profile."""
+    select a profile. The token row is returned so turns can record which device
+    produced them (conversation_turn.auth_token_id)."""
     async with get_sessionmaker()() as session:
         token = await verify_token(session, raw_token, kind="device")
         if token is None:
@@ -75,4 +91,4 @@ async def authenticate_device_ws(raw_token: str) -> Profile | None:
         profile = await session.get(Profile, token.profile_id)
         if profile is None or not profile.active:
             return None
-        return profile
+        return profile, token

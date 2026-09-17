@@ -119,9 +119,13 @@ JSON (text) frames and binary frames are interleaved on the same connection.
 | `arm_timeout` | JSON | — | `[tap only]` no speech arrived within `vad_arm_timeout_s` of `turn_start`; the armed turn is cancelled (`server.py:460`) | `{"type":"arm_timeout"}` |
 | `vad_error` | JSON | `text` (string) | `[tap only]` Silero VAD failed to initialize for this connection; the connection silently degrades to `hold` behavior for its lifetime (`server.py:418`) | `{"type":"vad_error","text":"VAD unavailable, using hold"}` |
 | `partial` | JSON | `text` (string) | `[hold only]` live partial transcript, re-decoded every `PARTIAL_EVERY_S` (0.4s) of new audio while held (`server.py:398`) | `{"type":"partial","text":"Hello how"}` |
+| `wake_model_meta` | JSON | `available` (bool); when true: `sha256` (hex), `threshold` (float), `base_version` (string), `bytes` (int), `created_at` (ISO) | both endpoints: once right after bind when the profile has an active personalized wake head (the offer), and again immediately before the binary head in answer to `wake_model_fetch` (`robin/wake.py`) | `{"type":"wake_model_meta","available":true,"sha256":"9f2c…","threshold":0.857,"base_version":"v3+om_r8avg9","bytes":205407,"created_at":"2026-09-16T…"}` |
+| *(binary)* | binary | — | right after the `wake_model_meta` that answers a `wake_model_fetch` | the personalized wake-word head: one complete ONNX file. Client verifies `sha256`, swaps atomically, reloads; on any failure it keeps the shipped base model + base threshold. The `threshold` in the meta frame belongs to exactly this head — never mix them. |
 
 Notes:
-- There is no message sent immediately on connect — the server only reacts to client input.
+- The only message sent unprompted on connect is the `wake_model_meta` offer, and only when
+  the profile has an active personalized wake head — otherwise the server only reacts to
+  client input.
 - `ttft`/`ttfs`/timing values are **not** sent to the client; they're server-side log/telemetry
   only (`server.py:292`).
 
@@ -133,6 +137,7 @@ Notes:
 | `turn_start` | JSON | — | `/ws-stream`, `tap` only | arms VAD for one new turn; server replies with `vad_state:{"state":"ARMED"}` (`server.py:435-445`). Must be resent for every turn — the client's reference implementation auto-resends it after each `done` (`tap_index.html:84-88`) to stay hands-free. |
 | `end` | JSON | — | `/ws-stream`, `hold` only | marks end-of-utterance for the audio streamed since the preceding `start` (`server.py:378`) |
 | `client_telemetry` | JSON | free-form (`{type:"client_telemetry", ...}`) | `/ws` only | playback-timing telemetry, appended verbatim to `logs/telemetry/<session>.jsonl` (`server.py:265-267`). **Sending this to `/ws-stream` is a no-op** — neither `_run_tap` nor `_run_hold` recognizes the type; it's silently ignored. |
+| `wake_model_fetch` | JSON | — | both endpoints | asks for the profile's active personalized wake head. Server answers `wake_model_meta` then (when available) one binary ONNX frame — see the server → client table. Clients send this only when the offered `sha256` differs from their cached head. |
 | *(binary)* | binary | raw PCM16LE mono (see above) | `/ws-stream` | one chunk of the utterance being streamed |
 | *(binary)* | binary | whole `MediaRecorder` blob | `/ws` | the entire recorded turn, sent once |
 
@@ -145,8 +150,9 @@ Notes:
    profile, loads that profile's `voice`/`speech_rate`/`timezone`/`context` for the lifetime
    of the connection, assigns a human-readable `session` id for logs plus a fresh session
    UUID under which this connection's turns are persisted (`robin/README.md` §3), and logs
-   it; nothing else is sent to the client at this point. A reconnect is a new session UUID —
-   there is no resume.
+   it. If the profile has an active personalized wake-word head, the server then sends the
+   `wake_model_meta` offer (nothing otherwise). A reconnect is a new session UUID — there is
+   no resume.
 2. **Turn start** (`tap`): client sends `turn_start` (and, once per connection, `start` if it
    wants to declare a non-16000 Hz rate) → server replies `vad_state: ARMED` → client streams
    raw PCM16 binary frames.

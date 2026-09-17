@@ -1,6 +1,7 @@
 import { clearStoredSession, getAuthToken } from "./auth";
 
-const rawBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "";
+// Default to the same-origin /api proxy (see next.config.ts rewrites).
+const rawBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "/api";
 
 const API_BASE_URL = rawBaseUrl.replace(/\/$/, "");
 const REQUEST_TIMEOUT_MS = 10000;
@@ -265,6 +266,25 @@ export function revokeToken(tokenId: number) {
   return request<{ revoked: boolean }>(`/tokens/${tokenId}/revoke`, { method: "POST" });
 }
 
+/** A short spoken sample of one voice, as a WAV blob. First request for a voice can take
+ * several seconds (the server synthesizes it, downloading the voice weights if needed). */
+export async function fetchVoicePreview(voiceId: string): Promise<Blob> {
+  const token = getAuthToken();
+  const response = await fetch(`${API_BASE_URL}/voices/${voiceId}/preview`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!response.ok) {
+    let message = `Preview failed with status ${response.status}`;
+    try {
+      message = extractDetail(await response.json(), message);
+    } catch {
+      // keep default
+    }
+    throw new ApiError(response.status, message);
+  }
+  return response.blob();
+}
+
 // ---------------------------------------------------------------------------
 // Chats
 
@@ -290,23 +310,30 @@ export interface Turn {
 
 export function fetchSessions(
   profileId: number,
-  params: { before?: string; limit?: number } = {},
+  params: { before?: string; limit?: number; include_diagnostic?: boolean } = {},
 ) {
   const query = new URLSearchParams();
   if (params.before) query.set("before", params.before);
   if (params.limit != null) query.set("limit", String(params.limit));
+  if (params.include_diagnostic) query.set("include_diagnostic", "true");
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return request<{ sessions: SessionSummary[] }>(`/profiles/${profileId}/sessions${suffix}`);
 }
 
 export function fetchTurns(
   profileId: number,
-  params: { session_id?: string; before?: string; limit?: number } = {},
+  params: {
+    session_id?: string;
+    before?: string;
+    limit?: number;
+    include_diagnostic?: boolean;
+  } = {},
 ) {
   const query = new URLSearchParams();
   if (params.session_id) query.set("session_id", params.session_id);
   if (params.before) query.set("before", params.before);
   if (params.limit != null) query.set("limit", String(params.limit));
+  if (params.include_diagnostic) query.set("include_diagnostic", "true");
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return request<{ turns: Turn[] }>(`/profiles/${profileId}/turns${suffix}`);
 }
@@ -332,11 +359,129 @@ export interface Activity {
 
 export function fetchActivity(
   profileId: number,
-  params: { date_from?: string; date_to?: string } = {},
+  params: { date_from?: string; date_to?: string; include_diagnostic?: boolean } = {},
 ) {
   const query = new URLSearchParams();
   if (params.date_from) query.set("date_from", params.date_from);
   if (params.date_to) query.set("date_to", params.date_to);
+  if (params.include_diagnostic) query.set("include_diagnostic", "true");
   const suffix = query.toString() ? `?${query.toString()}` : "";
   return request<Activity>(`/profiles/${profileId}/activity${suffix}`);
+}
+
+// ---------------------------------------------------------------------------
+// Wake word enrollment
+
+export interface WakeClip {
+  id: number;
+  label: string; // "positive" (the wake word) | "negative" (ordinary speech)
+  duration_s: number;
+  sha256: string;
+  created_at: string;
+}
+
+export interface WakeTraining {
+  state: "running" | "done" | "failed";
+  detail: string;
+  started_at: string;
+}
+
+export interface WakeModelStatus {
+  available: boolean;
+  sha256: string | null;
+  base_version: string | null;
+  threshold: number | null;
+  created_at: string | null;
+  manifest: JsonObject | null;
+  /** Current takes differ from the set the active model was trained on — Register unlocks. */
+  clips_changed: boolean;
+  positives: number;
+  training: WakeTraining | null;
+}
+
+export function fetchWakeClips(profileId: number) {
+  return request<{ clips: WakeClip[] }>(`/profiles/${profileId}/wake-clips`);
+}
+
+export function deleteWakeClip(profileId: number, clipId: number) {
+  return request<{ deleted: boolean }>(`/profiles/${profileId}/wake-clips/${clipId}`, {
+    method: "DELETE",
+  });
+}
+
+export function fetchWakeModel(profileId: number) {
+  return request<WakeModelStatus>(`/profiles/${profileId}/wake-model`);
+}
+
+/** The Register button: start a server-side training run on the current takes. */
+export function trainWakeModel(profileId: number) {
+  return request<{ started: boolean }>(`/profiles/${profileId}/wake-model/train`, {
+    method: "POST",
+  });
+}
+
+/** Upload one recorded take as a raw WAV body (16 kHz mono PCM16 — the trainer's input
+ * contract, encoded client-side). Not JSON, so this bypasses request(). */
+export async function uploadWakeClip(
+  profileId: number,
+  wav: Blob,
+  label: "positive" | "negative" = "positive",
+): Promise<WakeClip> {
+  const token = getAuthToken();
+  const response = await fetch(`${API_BASE_URL}/profiles/${profileId}/wake-clips?label=${label}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "audio/wav",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: wav,
+  });
+  if (!response.ok) {
+    let message = `Upload failed with status ${response.status}`;
+    try {
+      message = extractDetail(await response.json(), message);
+    } catch {
+      // keep default
+    }
+    throw new ApiError(response.status, message);
+  }
+  return response.json() as Promise<WakeClip>;
+}
+
+/** One stored take, as a playable WAV blob. */
+export async function fetchWakeClipAudio(profileId: number, clipId: number): Promise<Blob> {
+  const token = getAuthToken();
+  const response = await fetch(`${API_BASE_URL}/profiles/${profileId}/wake-clips/${clipId}/audio`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!response.ok) {
+    throw new ApiError(response.status, `Audio fetch failed with status ${response.status}`);
+  }
+  return response.blob();
+}
+
+// ---------------------------------------------------------------------------
+// Live voice session (diagnostic page)
+
+export interface Health {
+  status: string;
+  stt_loaded: boolean;
+  tts_loaded: boolean;
+  turn_mode: string; // "tap" | "hold"
+}
+
+export function fetchHealth() {
+  return request<Health>("/health");
+}
+
+/** Base URL for the voice WebSocket: NEXT_PUBLIC_VOICE_WS_URL when set, else the API
+ * base with ws(s) scheme — for the default same-origin "/api" that means the socket
+ * rides the Next proxy (which does forward WS upgrades), so a single forwarded port
+ * 3000 carries the whole dashboard, live audio included. */
+export function voiceWsUrl(): string {
+  const explicit = process.env.NEXT_PUBLIC_VOICE_WS_URL;
+  if (explicit) return explicit.replace(/\/$/, "");
+  if (/^https?:/.test(API_BASE_URL)) return API_BASE_URL.replace(/^http/, "ws");
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${window.location.host}${API_BASE_URL}`;
 }

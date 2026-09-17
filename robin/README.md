@@ -62,7 +62,11 @@ URL is the same one the tablets use — locally `http://<host>:8000`, deployed
 ### Dashboard frontend
 
 A Next.js app in `frontend/` (adapted from the `robin-ca-mirror` frontend, branch `Alex`):
-login, Users (admin provisioning), Chats (conversation viewer), Activities (daily usage).
+login, Users (admin provisioning), Chats (conversation viewer), Live (browser voice
+session — the tablet diagnostic, same `/ws-stream` protocol and device-token auth; the
+socket rides the same-origin `/api` proxy, so one forwarded port 3000 carries everything —
+override with `NEXT_PUBLIC_VOICE_WS_URL` to hit a FastAPI origin directly), Activities
+(daily usage).
 Node lives in the `web` conda env; the API base URL comes from `frontend/.env.local`
 (`NEXT_PUBLIC_API_BASE_URL=http://localhost:8000`).
 
@@ -98,6 +102,9 @@ env's python directly — `conda run` swallows the password prompt's stdin):
 | `issue-device-token` | `--profile-id --label "Tab A9 living room"` | the token id and the **raw token, once** |
 | `revoke-token` | `--token-id` | confirmation |
 | `list-tokens` | `[--profile-id]` | id, kind, subject, label, `last_used_at`, `revoked_at` — never the token |
+| `wake-clips-export` | `--profile-id --out DIR` | the profile's enrollment clips as `DIR/{positives,negatives}/*.wav` — the trainer's input layout (§4c) |
+| `wake-model-ingest` | `--profile-id DIR` | stores + activates a trained head from an `enroll_train.py` output dir; refuses a failed FA gate |
+| `list-wake-models` | `[--profile-id]` | id, profile, base version, sha, threshold, active, created |
 
 Typical new-household sequence:
 
@@ -179,6 +186,14 @@ background threads); a failed write is logged and never kills the connection or 
 synthesis and never stored. `turn_index` is 0-based and unique per `session_id` (DB
 constraint). `speaker_id` exists but stays null — reserved for future speaker ID.
 
+Every turn also records `auth_token_id` — which device token's connection produced it
+(nullable: pre-existing rows; `SET NULL` on token delete so revoking a credential never
+deletes history). Provenance, not authorization — and what makes diagnostic sessions
+separable: tokens whose `label` starts with `diagnostic` (the Live page issues them as
+`diagnostic: browser — <admin email>`) are excluded from the sessions/activity/turns
+endpoints unless `include_diagnostic=true`, so browser test sessions don't pollute real
+deployment data. Turns with no token provenance count as real data.
+
 ---
 
 ## 4. Dashboard HTTP endpoints
@@ -250,7 +265,8 @@ deactivation is an operator action. Changes reach the device on its next connect
 
 Conversations as `(session_id, timing, turn count)` summaries, most recently active first —
 so a chat viewer never has to page every turn to group them. Query parameters: `before`
-(a `last_at` cursor) and `limit` (default 50, max 200).
+(a `last_at` cursor), `limit` (default 50, max 200), and `include_diagnostic` (default
+false — diagnostic-token sessions are hidden; same parameter on `/activity` and `/turns`).
 
 ```json
 {"sessions": [{"session_id": "bc27e653-...", "started_at": "...", "last_at": "...",
@@ -322,6 +338,68 @@ the issuance response.
 
 ---
 
+## 4c. Wake-word personalization (`robin/api/wake.py`, `robin/wake.py`)
+
+The tablet runs a local "Hey Robin" detector; each profile can get a head fine-tuned on
+their own voice. The loop has four legs — record, train, ingest, deliver — and all the
+code lives in this repo; only the training DATA and env stay in `~/Project/oww-train`
+(the base model, the anchor features that keep a few clips from destroying background
+rejection, and the openWakeWord checkout), reached via the trainer's `--oww-root`:
+
+1. **Record** — dashboard "Wake Word" page: 2 s takes, captured client-side as 16 kHz
+   mono PCM16 WAV (the trainer's exact input contract, no server transcoding) and stored
+   in `wake_clip`. Each take passes two content gates at upload (`robin/api/wake.py`;
+   server.py registers both hooks, tests register fakes or none): the server's resident
+   STT checks the words (a positive must transcribe as the wake word, a negative must
+   not — rejected as "came through garbled, check the microphone"), and the shared base
+   wake head itself must score the take above `WAKE_SCORE_FLOOR` (0.2). The second gate
+   exists because STT decodes speech far too degraded for the 50k-parameter detector —
+   the first real enrollment had 3 of 7 STT-approved takes score ~0.0 on the head,
+   which poisoned training and failed the FA gate.
+   Clips are the retraining asset: a trained head is welded to one base version, so a
+   base bump means retraining every profile from its kept clips.
+2. **Train** — the Wake Word page's **Register** button (`POST
+   /profiles/{id}/wake-model/train`): a server-side job (`robin/train.py`) exports the
+   clips, runs `scripts/enroll_train.py` as a subprocess in the oww-train env, and
+   ingests the result. The button's lock is derived, never tracked: the active model's
+   manifest records the sha256 of every clip it was trained on, and Register is locked
+   exactly while the current clip set matches that record — any recording or deletion
+   unlocks it. The trainer runs the standard 12x augmentation, then a test-time alpha
+   grid: the trained adapter (always fit at alpha=8) is rescaled to alpha in
+   {1, 2, 4, 6, 8} and the candidate with the best AUC — the person's takes ranked
+   against held-out background, ties to the smaller alpha — ships, with its own
+   calibrated threshold. Selection never touches oww-train's samples/ benchmark (that
+   stays report-only). The chosen alpha and the full sweep land in the manifest. The
+   FA gate then applies to the chosen candidate; a `failed_gate` run is reported on
+   the page and never activated. (A pitch/tempo "voice variant" pre-pass was tried and
+   removed — the phase-vocoder artifacts read as noise to the wake head and poisoned
+   training; see the note in scripts/enroll_train.py.)
+   The CLI path (`wake-clips-export` -> `scripts/enroll_train.py` ->
+   `wake-model-ingest`) does the same three legs by hand.
+3. **Ingest** — automatic after a Register run; by hand,
+   `python -m robin.admin wake-model-ingest --profile-id N DIR/model`. Both verify the
+   manifest (status + sha256) and activate the head atomically (the previous row is
+   deactivated in the same commit; a partial unique index enforces one active head per
+   profile).
+4. **Deliver** — on the next voice-socket connect the server sends a `wake_model_meta`
+   offer; the tablet compares `sha256` with its cache and sends `wake_model_fetch` to get
+   the ONNX as one binary frame (see `API.md`). The threshold always travels in the same
+   meta frame as the model — the pair is one artifact. On any failure the tablet keeps
+   the shipped base model.
+
+Dashboard endpoints (same 404-for-unlinked rule; mutations need `owner`/admin):
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/profiles/{id}/wake-clips?label=positive\|negative` | body = raw WAV (`audio/wav`), 16 kHz mono PCM16; 422 otherwise; duplicate 409 |
+| `GET` | `/profiles/{id}/wake-clips` | clip metadata (never blobs) |
+| `GET` | `/profiles/{id}/wake-clips/{cid}/audio` | one clip, bit-for-bit as uploaded |
+| `DELETE` | `/profiles/{id}/wake-clips/{cid}` | `{"deleted": true}` |
+| `GET` | `/profiles/{id}/wake-model` | active head status: sha, base, threshold, manifest, `clips_changed` (Register lock), `training` (job state) — never the ONNX |
+| `POST` | `/profiles/{id}/wake-model/train` | the Register button: start a training job (202; 409 running or unchanged set, 422 no takes) |
+
+---
+
 ## 5. Complete endpoint map
 
 | Method | Path | Auth | Purpose |
@@ -338,6 +416,7 @@ the issuance response.
 | `GET` | `/profiles/{id}/activity` | dashboard Bearer | per-day usage in the profile's timezone |
 | `GET` | `/profiles/{id}/turns` | dashboard Bearer | conversation history, paginated |
 | — | `/accounts`, `/profiles` (POST), `/profiles/{id}/links*`, `/profiles/{id}/device-tokens`, `/tokens*` | **admin** Bearer | provisioning (§4b) |
+| — | `/profiles/{id}/wake-clips*`, `/profiles/{id}/wake-model` | dashboard Bearer (mutations: `owner`/admin) | wake-word enrollment (§4c) |
 | `GET` | `/health` | none | liveness + model/turn-mode status |
 | `GET` | `/`, `/classic`, `/stream` | none | demo pages |
 | `GET` | `/dashboard` | none (page); its API calls need the key | live-session dashboard page |
@@ -355,15 +434,19 @@ The last three predate this layer and still use the `ROBIN_API_KEY` shared secre
 ```
 robin/
   db/__init__.py      async engine + session factory; DATABASE_URL required, no default
-  db/models.py        Profile, Account, AccountProfile, AuthToken, ConversationTurn
+  db/models.py        Profile, Account, AccountProfile, AuthToken, WakeModel, WakeClip,
+                      ConversationTurn
   auth/passwords.py   argon2id hash/verify (argon2-cffi defaults)
   auth/tokens.py      issue / verify (throttled last_used_at) / revoke
   auth/deps.py        require_dashboard, role lookup, authenticate_device_ws
   api/auth.py         /auth/login, /auth/logout, /auth/me
   api/profiles.py     /profiles endpoints (incl. /sessions, /activity) + response models
   api/admin.py        admin provisioning endpoints (§4b)
+  api/wake.py         wake-word enrollment endpoints (§4c)
   ws.py               bind_device_session (WS auth + profile snapshot), persist_turn
-  admin/              the CLI (python -m robin.admin)
+  wake.py             wake-model offer/fetch delivery over the voice socket (§4c)
+  admin/              the CLI (python -m robin.admin), incl. wake-clips-export /
+                      wake-model-ingest / list-wake-models
 migrations/           Alembic (async env; URL from DATABASE_URL)
 frontend/             Next.js dashboard (login, Users, Chats, Activities)
 tests/                pytest against TEST_DATABASE_URL; stub app mounts the same

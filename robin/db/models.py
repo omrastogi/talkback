@@ -1,4 +1,4 @@
-"""The five tables. SQLAlchemy 2.0 declarative with Mapped[...] / mapped_column only.
+"""The seven tables. SQLAlchemy 2.0 declarative with Mapped[...] / mapped_column only.
 
 Two deliberate absences, both traceable to the RECOVER review:
   - No relationship() attributes. Nothing here can be "expanded" into a response the way
@@ -110,6 +110,56 @@ class AuthToken(Base):
     created_at: Mapped[datetime.datetime] = _ts()
 
 
+class WakeModel(Base):
+    """One trained wake-word head per row (merged LoRA, plain ONNX, ~205 KB); at most one
+    active per profile, enforced by a partial unique index. The threshold column is part
+    of the artifact, not a tunable: the head was calibrated to an FA budget at exactly
+    that value, and serving the blob without it turns a personalization into a regression
+    (oww-train LORA.md). Retraining inserts a new row and flips `active`; old rows stay
+    for lineage. Enrollment clip hashes, seeds, and calibration numbers live in
+    `manifest`, verbatim from the trainer."""
+    __tablename__ = "wake_model"
+    __table_args__ = (
+        Index("uq_wake_model_profile_active", "profile_id", unique=True,
+              postgresql_where=text("active")),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    profile_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("profile.id", ondelete="CASCADE"), nullable=False)
+    base_version: Mapped[str] = mapped_column(Text, nullable=False)   # e.g. "v3+om_r8avg9"
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)         # hex, of `onnx`
+    onnx: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    threshold: Mapped[float] = mapped_column(REAL, nullable=False)
+    manifest: Mapped[dict] = mapped_column(JSONB, nullable=False,
+                                           server_default=text("'{}'::jsonb"))
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    created_at: Mapped[datetime.datetime] = _ts()
+
+
+class WakeClip(Base):
+    """One enrollment utterance, recorded on the dashboard (16 kHz mono PCM16 WAV,
+    ~64 KB for 2 s — small enough for bytea). Clips are the retraining asset, not a
+    cache: a trained head is welded to one base version, so when the shared base bumps,
+    every profile's head is retrained from its kept clips. positive = the wake word;
+    negative = the person's ordinary speech."""
+    __tablename__ = "wake_clip"
+    __table_args__ = (
+        CheckConstraint("label IN ('positive', 'negative')", name="wake_clip_label"),
+        # The same recording uploaded twice (double-click, retry) is one clip.
+        UniqueConstraint("profile_id", "sha256", name="uq_wake_clip_profile_sha"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    profile_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("profile.id", ondelete="CASCADE"), nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    wav: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    duration_s: Mapped[float] = mapped_column(REAL, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)         # hex, of `wav`
+    created_at: Mapped[datetime.datetime] = _ts()
+
+
 class ConversationTurn(Base):
     """One row per utterance. `content` is display text ("8:00 PM"); the spoken form from
     server.for_speech() is derived at synthesis time and never persisted."""
@@ -124,6 +174,11 @@ class ConversationTurn(Base):
     profile_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("profile.id", ondelete="CASCADE"), nullable=False)
     session_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # Which device token's connection produced this turn. Provenance, not authorization:
+    # nullable (pre-existing rows, proactive paths without a socket), and SET NULL rather
+    # than CASCADE — deleting a token must never delete conversation history.
+    auth_token_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("auth_token.id", ondelete="SET NULL"), nullable=True)
     turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
     role: Mapped[str] = mapped_column(Text, nullable=False)          # user | assistant | system
     content: Mapped[str] = mapped_column(Text, nullable=False)

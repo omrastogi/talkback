@@ -12,14 +12,29 @@ import zoneinfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import Date, cast, func, select
+from sqlalchemy import Date, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from robin.auth.deps import account_profile_role, require_dashboard
 from robin.db import get_session
-from robin.db.models import Account, AccountProfile, ConversationTurn, Profile
+from robin.db.models import Account, AccountProfile, AuthToken, ConversationTurn, Profile
 
 router = APIRouter(prefix="/profiles", tags=["profiles"])
+
+# Device tokens whose label starts with this mark diagnostic sessions (the dashboard's
+# Live page issues them as "diagnostic: browser — <admin email>"). Their turns persist
+# like any other — same protocol as the tablet — but the history/activity endpoints
+# exclude them unless include_diagnostic=true, so test sessions don't pollute real data.
+DIAGNOSTIC_LABEL_PREFIX = "diagnostic"
+
+
+def _exclude_diagnostic_clause():
+    """WHERE clause keeping only non-diagnostic turns. Rows with no token provenance
+    (pre-migration history, proactive paths) are real data and are kept."""
+    diagnostic_token_ids = select(AuthToken.id).where(
+        AuthToken.label.ilike(f"{DIAGNOSTIC_LABEL_PREFIX}%"))
+    return or_(ConversationTurn.auth_token_id.is_(None),
+               ConversationTurn.auth_token_id.not_in(diagnostic_token_ids))
 
 
 class ProfileResponse(BaseModel):
@@ -177,6 +192,7 @@ async def patch_profile(profile_id: int, body: ProfilePatch,
 async def list_sessions(profile_id: int,
                         before: datetime.datetime | None = Query(default=None),
                         limit: int = Query(default=50, ge=1, le=200),
+                        include_diagnostic: bool = Query(default=False),
                         account: Account = Depends(require_dashboard),
                         session: AsyncSession = Depends(get_session)):
     """Conversations for one profile as (session_id, timing, turn count) summaries,
@@ -190,6 +206,8 @@ async def list_sessions(profile_id: int,
                 func.array_agg(ConversationTurn.source.distinct()).label("sources"))
          .where(ConversationTurn.profile_id == profile_id)
          .group_by(ConversationTurn.session_id))
+    if not include_diagnostic:
+        q = q.where(_exclude_diagnostic_clause())
     if before is not None:
         q = q.having(last_at < before)
     q = q.order_by(last_at.desc()).limit(limit)
@@ -205,6 +223,7 @@ async def list_sessions(profile_id: int,
 async def activity(profile_id: int,
                    date_from: datetime.date | None = Query(default=None),
                    date_to: datetime.date | None = Query(default=None),
+                   include_diagnostic: bool = Query(default=False),
                    account: Account = Depends(require_dashboard),
                    session: AsyncSession = Depends(get_session)):
     """Per-day usage derived from conversation_turn, bucketed in the profile's timezone
@@ -233,11 +252,13 @@ async def activity(profile_id: int,
          .where(ConversationTurn.profile_id == profile_id,
                 day.between(date_from, date_to))
          .group_by(day).order_by(day))
+    last_active_q = (select(func.max(ConversationTurn.created_at))
+                     .where(ConversationTurn.profile_id == profile_id))
+    if not include_diagnostic:
+        q = q.where(_exclude_diagnostic_clause())
+        last_active_q = last_active_q.where(_exclude_diagnostic_clause())
     rows = (await session.execute(q)).all()
-    last_active_at = (await session.execute(
-        select(func.max(ConversationTurn.created_at))
-        .where(ConversationTurn.profile_id == profile_id)
-    )).scalar_one_or_none()
+    last_active_at = (await session.execute(last_active_q)).scalar_one_or_none()
     return ActivityResponse(timezone=profile.timezone, days=[
         ActivityDay(day=r.day, sessions=r.sessions, user_turns=r.user_turns,
                     assistant_turns=r.assistant_turns, proactive_turns=r.proactive_turns,
@@ -253,12 +274,15 @@ async def list_turns(profile_id: int,
                      session_id: uuid.UUID | None = Query(default=None),
                      before: datetime.datetime | None = Query(default=None),
                      limit: int = Query(default=100, ge=1, le=500),
+                     include_diagnostic: bool = Query(default=False),
                      account: Account = Depends(require_dashboard),
                      session: AsyncSession = Depends(get_session)):
     """Turns for one profile, newest first; page with `before` (a created_at cursor) or
     narrow to one conversation with `session_id`."""
     await _linked_profile_or_404(session, account, profile_id)
     q = select(ConversationTurn).where(ConversationTurn.profile_id == profile_id)
+    if not include_diagnostic:
+        q = q.where(_exclude_diagnostic_clause())
     if session_id is not None:
         q = q.where(ConversationTurn.session_id == session_id)
     if before is not None:

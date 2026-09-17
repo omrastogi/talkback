@@ -1,15 +1,15 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useForm, useStore } from '@tanstack/react-form'
 import AppShell from '../../components/AppShell'
 import {
-  createAccount,
   createProfile,
   fetchAccounts,
   fetchProfileLinks,
   fetchProfiles,
   fetchTokens,
+  fetchVoicePreview,
   issueDeviceToken,
   isSessionExpired,
   linkAccountProfile,
@@ -48,19 +48,35 @@ function allTimezones(): string[] {
   }
 }
 
-// Kokoro-82M voices (fetched on demand by the server). Prefix decodes as
-// a=American/b=British + f=female/m=male.
+// All English Kokoro-82M voices (weights are pre-downloaded on the server). Prefix
+// decodes as a=American/b=British + f=female/m=male.
 const KOKORO_VOICES = [
   { id: 'af_heart', label: 'Heart — American female (default)' },
+  { id: 'af_alloy', label: 'Alloy — American female' },
+  { id: 'af_aoede', label: 'Aoede — American female' },
   { id: 'af_bella', label: 'Bella — American female' },
+  { id: 'af_jessica', label: 'Jessica — American female' },
+  { id: 'af_kore', label: 'Kore — American female' },
   { id: 'af_nicole', label: 'Nicole — American female' },
+  { id: 'af_nova', label: 'Nova — American female' },
+  { id: 'af_river', label: 'River — American female' },
   { id: 'af_sarah', label: 'Sarah — American female' },
   { id: 'af_sky', label: 'Sky — American female' },
   { id: 'am_adam', label: 'Adam — American male' },
-  { id: 'am_michael', label: 'Michael — American male' },
+  { id: 'am_echo', label: 'Echo — American male' },
   { id: 'am_eric', label: 'Eric — American male' },
+  { id: 'am_fenrir', label: 'Fenrir — American male' },
+  { id: 'am_liam', label: 'Liam — American male' },
+  { id: 'am_michael', label: 'Michael — American male' },
+  { id: 'am_onyx', label: 'Onyx — American male' },
+  { id: 'am_puck', label: 'Puck — American male' },
+  { id: 'am_santa', label: 'Santa — American male' },
+  { id: 'bf_alice', label: 'Alice — British female' },
   { id: 'bf_emma', label: 'Emma — British female' },
   { id: 'bf_isabella', label: 'Isabella — British female' },
+  { id: 'bf_lily', label: 'Lily — British female' },
+  { id: 'bm_daniel', label: 'Daniel — British male' },
+  { id: 'bm_fable', label: 'Fable — British male' },
   { id: 'bm_george', label: 'George — British male' },
   { id: 'bm_lewis', label: 'Lewis — British male' }
 ]
@@ -114,17 +130,18 @@ export default function UsersPage() {
   const [issuedToken, setIssuedToken] = useState<DeviceTokenIssue | null>(null)
   const [errorMessage, setErrorMessage] = useState('')
 
-  // Account create form (plain controlled inputs; only the profile form needs react-form).
-  const [newAccountEmail, setNewAccountEmail] = useState('')
-  const [newAccountName, setNewAccountName] = useState('')
-  const [newAccountPassword, setNewAccountPassword] = useState('')
-  const [newAccountIsAdmin, setNewAccountIsAdmin] = useState(false)
-  const [isCreatingAccount, setIsCreatingAccount] = useState(false)
-
-  // Link + token forms.
+  // Link + token forms. Accounts themselves are managed on the Accounts page; the list
+  // is only needed here to show emails and fill the link dropdown.
   const [linkAccountId, setLinkAccountId] = useState('')
   const [linkRole, setLinkRole] = useState<'owner' | 'viewer'>('owner')
   const [tokenLabel, setTokenLabel] = useState('')
+
+  // Voice preview panel. Blob URLs are cached per voice for the page's lifetime.
+  const [isVoicePanelOpen, setIsVoicePanelOpen] = useState(false)
+  const [playingVoice, setPlayingVoice] = useState<string | null>(null)
+  const [loadingVoice, setLoadingVoice] = useState<string | null>(null)
+  const previewUrlsRef = useRef(new Map<string, string>())
+  const audioRef = useRef<HTMLAudioElement | null>(null)
 
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) || null
 
@@ -132,6 +149,10 @@ export default function UsersPage() {
     defaultValues: EMPTY_PROFILE_FORM,
 
     onSubmit: async ({ value, formApi }) => {
+      if (!value.displayName.trim()) {
+        setErrorMessage('Display name is required.')
+        return
+      }
       let context: JsonObject = {}
       if (value.contextJson.trim()) {
         try {
@@ -167,12 +188,13 @@ export default function UsersPage() {
         } else if (selectedProfileId) {
           await patchProfile(selectedProfileId, {
             display_name: value.displayName.trim(),
-            timezone: value.timezone.trim(),
-            voice: value.voice.trim(),
+            // Empty means "leave unchanged" — the backend rejects empty strings.
+            ...(value.timezone.trim() ? { timezone: value.timezone.trim() } : {}),
+            ...(value.voice.trim() ? { voice: value.voice.trim() } : {}),
             ...(speechRate !== null ? { speech_rate: speechRate } : {}),
             context
           })
-          formApi.reset(value)
+          formApi.reset(value, { keepDefaultValues: true })
           setIsEditingProfile(false)
           await loadProfiles()
         }
@@ -228,29 +250,6 @@ export default function UsersPage() {
     }
   }
 
-  async function handleCreateAccount() {
-    if (!newAccountEmail.trim() || !newAccountName.trim() || !newAccountPassword) return
-    setIsCreatingAccount(true)
-    setErrorMessage('')
-    try {
-      await createAccount({
-        email: newAccountEmail.trim(),
-        display_name: newAccountName.trim(),
-        password: newAccountPassword,
-        is_admin: newAccountIsAdmin
-      })
-      setNewAccountEmail('')
-      setNewAccountName('')
-      setNewAccountPassword('')
-      setNewAccountIsAdmin(false)
-      await loadAccounts()
-    } catch (error) {
-      handleRequestError(error, 'Failed to create the account.')
-    } finally {
-      setIsCreatingAccount(false)
-    }
-  }
-
   async function handleLink() {
     if (!selectedProfileId || !linkAccountId) return
     setErrorMessage('')
@@ -302,24 +301,64 @@ export default function UsersPage() {
     }
   }
 
+  function stopVoicePlayback() {
+    audioRef.current?.pause()
+    audioRef.current = null
+    setPlayingVoice(null)
+  }
+
+  async function handlePlayVoice(voiceId: string) {
+    if (playingVoice === voiceId) {
+      stopVoicePlayback()
+      return
+    }
+    stopVoicePlayback()
+    try {
+      let url = previewUrlsRef.current.get(voiceId)
+      if (!url) {
+        setLoadingVoice(voiceId)
+        const blob = await fetchVoicePreview(voiceId)
+        url = URL.createObjectURL(blob)
+        previewUrlsRef.current.set(voiceId, url)
+      }
+      const audio = new Audio(url)
+      audio.onended = () => setPlayingVoice((current) => (current === voiceId ? null : current))
+      audioRef.current = audio
+      setPlayingVoice(voiceId)
+      await audio.play()
+    } catch (error) {
+      handleRequestError(error, `Could not play a preview of ${voiceId}.`)
+      setPlayingVoice(null)
+    } finally {
+      setLoadingVoice(null)
+    }
+  }
+
   function handleStartCreateProfile() {
     setIsCreatingProfile(true)
     setIsEditingProfile(false)
     setErrorMessage('')
-    form.reset(EMPTY_PROFILE_FORM)
+    form.reset(EMPTY_PROFILE_FORM, { keepDefaultValues: true })
   }
 
   function handleStartEditProfile() {
     if (!selectedProfile) return
     setIsEditingProfile(true)
+    setIsCreatingProfile(false)
     setErrorMessage('')
+    // keepDefaultValues on every reset: without it, reset(values) rewrites the form's
+    // defaultValues, and useForm's per-render options sync then clobbers the values
+    // back to EMPTY_PROFILE_FORM on the next render (the form is untouched post-reset).
+    form.reset(buildProfileForm(selectedProfile), { keepDefaultValues: true })
   }
 
   function handleCancelProfileForm() {
     setIsCreatingProfile(false)
     setIsEditingProfile(false)
     setErrorMessage('')
-    form.reset(selectedProfile ? buildProfileForm(selectedProfile) : EMPTY_PROFILE_FORM)
+    form.reset(selectedProfile ? buildProfileForm(selectedProfile) : EMPTY_PROFILE_FORM, {
+      keepDefaultValues: true
+    })
   }
 
   useEffect(() => {
@@ -336,7 +375,7 @@ export default function UsersPage() {
     if (!selectedProfileId) {
       setLinks([])
       setTokens([])
-      form.reset(EMPTY_PROFILE_FORM)
+      form.reset(EMPTY_PROFILE_FORM, { keepDefaultValues: true })
       return
     }
     void loadLinksAndTokens(selectedProfileId)
@@ -347,7 +386,9 @@ export default function UsersPage() {
     if (isCreatingProfile || isEditingProfile) return
     // Never clobber edits that are still in flight.
     if (!form.state.isPristine) return
-    form.reset(selectedProfile ? buildProfileForm(selectedProfile) : EMPTY_PROFILE_FORM)
+    form.reset(selectedProfile ? buildProfileForm(selectedProfile) : EMPTY_PROFILE_FORM, {
+      keepDefaultValues: true
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProfile, isCreatingProfile, isEditingProfile])
 
@@ -359,6 +400,15 @@ export default function UsersPage() {
     }
     window.localStorage.setItem(SELECTED_PROFILE_STORAGE_KEY, String(selectedProfileId))
   }, [selectedProfileId])
+
+  useEffect(() => {
+    const urls = previewUrlsRef.current
+    return () => {
+      audioRef.current?.pause()
+      urls.forEach((url) => URL.revokeObjectURL(url))
+      urls.clear()
+    }
+  }, [])
 
   if (isChecking) {
     return (
@@ -382,9 +432,9 @@ export default function UsersPage() {
       <header className="hero hero-insights">
         <div className="hero-main">
           <div>
-            <p className="eyebrow">Users</p>
+            <p className="eyebrow">Profiles</p>
             <h2>{isCreatingProfile ? 'New profile' : selectedProfile?.display_name || 'Profiles'}</h2>
-            <p>Provision the people Robin talks to and the accounts that watch over them.</p>
+            <p>The people Robin talks to — their voice, timezone, device tokens, and who can see them.</p>
           </div>
 
           <div className="hero-filters hero-filters-insights">
@@ -410,8 +460,7 @@ export default function UsersPage() {
             </button>
 
             <div className="toolbar-meta">
-              <strong>{profiles.length}</strong> profiles · <strong>{accounts.length}</strong>{' '}
-              accounts
+              <strong>{profiles.length}</strong> profiles
             </div>
           </div>
         </div>
@@ -499,26 +548,38 @@ export default function UsersPage() {
                 </label>
                 <label className="field">
                   <span>Voice</span>
-                  <form.Field name="voice">
-                    {(field) => (
-                      <select
-                        disabled={formDisabled}
-                        onChange={(event) => field.handleChange(event.target.value)}
-                        value={field.state.value}
-                      >
-                        <option value="">Server default (af_heart)</option>
-                        {field.state.value &&
-                        !KOKORO_VOICES.some((v) => v.id === field.state.value) ? (
-                          <option value={field.state.value}>{field.state.value}</option>
-                        ) : null}
-                        {KOKORO_VOICES.map((v) => (
-                          <option key={v.id} value={v.id}>
-                            {v.label}
-                          </option>
-                        ))}
-                      </select>
-                    )}
-                  </form.Field>
+                  <div className="voice-select-row">
+                    <form.Field name="voice">
+                      {(field) => (
+                        <select
+                          disabled={formDisabled}
+                          onChange={(event) => field.handleChange(event.target.value)}
+                          value={field.state.value}
+                        >
+                          <option value="">Server default (af_heart)</option>
+                          {field.state.value &&
+                          !KOKORO_VOICES.some((v) => v.id === field.state.value) ? (
+                            <option value={field.state.value}>{field.state.value}</option>
+                          ) : null}
+                          {KOKORO_VOICES.map((v) => (
+                            <option key={v.id} value={v.id}>
+                              {v.label}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                    </form.Field>
+                    <button
+                      className="secondary-button"
+                      onClick={() => {
+                        if (isVoicePanelOpen) stopVoicePlayback()
+                        setIsVoicePanelOpen(!isVoicePanelOpen)
+                      }}
+                      type="button"
+                    >
+                      {isVoicePanelOpen ? 'Hide voices' : '🔊 Listen'}
+                    </button>
+                  </div>
                 </label>
                 <label className="field">
                   <form.Field name="speechRate">
@@ -541,6 +602,28 @@ export default function UsersPage() {
                   </form.Field>
                 </label>
               </div>
+
+              {isVoicePanelOpen ? (
+                <div className="voice-preview-panel">
+                  {KOKORO_VOICES.map((v) => (
+                    <div className="voice-preview-row" key={v.id}>
+                      <button
+                        className="secondary-button"
+                        disabled={loadingVoice !== null && loadingVoice !== v.id}
+                        onClick={() => void handlePlayVoice(v.id)}
+                        type="button"
+                      >
+                        {loadingVoice === v.id ? '…' : playingVoice === v.id ? '◼' : '▶'}
+                      </button>
+                      <span>{v.label}</span>
+                    </div>
+                  ))}
+                  <p className="form-note">
+                    The first play of a voice takes a few seconds while the server synthesizes
+                    it (and downloads the voice if it isn't cached yet).
+                  </p>
+                </div>
+              ) : null}
 
               <label className="field">
                 <span>Context (JSON, given to the prompt as personal data)</span>
@@ -573,7 +656,8 @@ export default function UsersPage() {
               <div className="panel-divider" />
 
               <div className="panel-header">
-                <h3>Linked accounts</h3>
+                <h3>Dashboard access</h3>
+                <span>Accounts are created on the Accounts page</span>
               </div>
               {links.length ? (
                 <table className="data-table">
@@ -745,98 +829,6 @@ export default function UsersPage() {
           ) : null}
         </section>
 
-        <section className="timeline-panel insights-panel">
-          <div className="panel-header">
-            <h3>Accounts</h3>
-            <span>Dashboard logins for care partners and the research team</span>
-          </div>
-
-          {accounts.length ? (
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>ID</th>
-                  <th>Email</th>
-                  <th>Name</th>
-                  <th>Admin</th>
-                  <th>Created</th>
-                </tr>
-              </thead>
-              <tbody>
-                {accounts.map((account) => (
-                  <tr key={account.id}>
-                    <td>{account.id}</td>
-                    <td>{account.email}</td>
-                    <td>{account.display_name}</td>
-                    <td>{account.is_admin ? <span className="pill">admin</span> : '—'}</td>
-                    <td>{formatTimestamp(account.created_at)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          ) : (
-            <div className="empty-state">No accounts yet.</div>
-          )}
-
-          <div className="panel-divider" />
-
-          <div className="panel-header">
-            <h3>New account</h3>
-          </div>
-          <div className="settings-grid">
-            <label className="field">
-              <span>Email</span>
-              <input
-                autoComplete="off"
-                onChange={(event) => setNewAccountEmail(event.target.value)}
-                placeholder="carepartner@example.org"
-                type="email"
-                value={newAccountEmail}
-              />
-            </label>
-            <label className="field">
-              <span>Display name</span>
-              <input
-                autoComplete="off"
-                onChange={(event) => setNewAccountName(event.target.value)}
-                type="text"
-                value={newAccountName}
-              />
-            </label>
-            <label className="field">
-              <span>Password (min 8 characters)</span>
-              <input
-                autoComplete="new-password"
-                onChange={(event) => setNewAccountPassword(event.target.value)}
-                type="password"
-                value={newAccountPassword}
-              />
-            </label>
-          </div>
-          <label className="auth-checkbox">
-            <input
-              checked={newAccountIsAdmin}
-              onChange={(event) => setNewAccountIsAdmin(event.target.checked)}
-              type="checkbox"
-            />
-            <span>Administrator (sees all profiles, can provision)</span>
-          </label>
-          <div className="inline-actions">
-            <button
-              className="send-button"
-              disabled={
-                isCreatingAccount ||
-                !newAccountEmail.trim() ||
-                !newAccountName.trim() ||
-                newAccountPassword.length < 8
-              }
-              onClick={() => void handleCreateAccount()}
-              type="button"
-            >
-              {isCreatingAccount ? 'Creating…' : 'Create account'}
-            </button>
-          </div>
-        </section>
       </div>
     </AppShell>
   )

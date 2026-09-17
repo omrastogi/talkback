@@ -31,6 +31,7 @@ class BoundSession:
     speech_rate: float
     timezone: str
     context: dict
+    auth_token_id: int | None = None    # which device token connected; stamped on every turn
     session_id: uuid.UUID = dataclasses.field(default_factory=uuid.uuid4)
     turn_index: int = 0
 
@@ -48,15 +49,17 @@ async def bind_device_session(ws: WebSocket) -> BoundSession | None:
     pattern (closing pre-accept surfaces as 1006 in browsers) with code 4401. On success
     the socket is accepted echoing the subprotocol, exactly as the shared-key auth did."""
     raw = ws_presented_token(ws)
-    profile = await authenticate_device_ws(raw) if raw else None
-    if profile is None:
+    authed = await authenticate_device_ws(raw) if raw else None
+    if authed is None:
         await ws.accept()
         await ws.close(code=WS_CLOSE_UNAUTHORIZED)
         return None
+    profile, token = authed
     await ws.accept(subprotocol=raw)
     return BoundSession(profile_id=profile.id, display_name=profile.display_name,
                        voice=profile.voice, speech_rate=profile.speech_rate,
-                       timezone=profile.timezone, context=profile.context)
+                       timezone=profile.timezone, context=profile.context,
+                       auth_token_id=token.id)
 
 
 async def persist_turn(bound: BoundSession | None, *, role: str, content: str,
@@ -70,6 +73,7 @@ async def persist_turn(bound: BoundSession | None, *, role: str, content: str,
         async with get_sessionmaker()() as session:
             session.add(ConversationTurn(
                 profile_id=bound.profile_id, session_id=bound.session_id,
+                auth_token_id=bound.auth_token_id,
                 turn_index=bound.next_index(), role=role, content=content,
                 source=source, latency_ms=latency_ms, meta=meta or {}))
             await session.commit()

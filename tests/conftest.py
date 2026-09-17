@@ -30,7 +30,7 @@ from robin.db.models import Base                                   # noqa: E402
 rdb._engine = create_async_engine(TEST_URL, poolclass=NullPool)
 rdb._sessionmaker = async_sessionmaker(rdb._engine, expire_on_commit=False)
 
-TABLES = "conversation_turn, auth_token, account_profile, account, profile"
+TABLES = "conversation_turn, wake_model, wake_clip, auth_token, account_profile, account, profile"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -70,12 +70,17 @@ def app():
     from robin.api.admin import router as admin_router
     from robin.api.auth import router as auth_router
     from robin.api.profiles import router as profiles_router
+    from robin.api.wake import device_router as wake_device_router
+    from robin.api.wake import router as wake_router
+    from robin.wake import offer_wake_model, send_wake_model
     from robin.ws import bind_device_session, persist_turn
 
     a = FastAPI()
     a.include_router(auth_router)
     a.include_router(profiles_router)
     a.include_router(admin_router)
+    a.include_router(wake_router)
+    a.include_router(wake_device_router)
 
     @a.websocket("/ws")
     async def ws_ep(ws: WebSocket):
@@ -93,6 +98,22 @@ def app():
                             "voice": bound.voice,
                             "client_sent_profile_id": payload.get("profile_id")})
         await ws.close()
+
+    @a.websocket("/ws-wake")
+    async def ws_wake_ep(ws: WebSocket):
+        """The wake-model delivery wiring exactly as server.py mounts it: offer after
+        bind, then answer wake_model_fetch frames until the client hangs up."""
+        bound = await bind_device_session(ws)
+        if bound is None:
+            return
+        await offer_wake_model(ws, bound)
+        try:
+            while True:
+                payload = await ws.receive_json()
+                if payload.get("type") == "wake_model_fetch":
+                    await send_wake_model(ws, bound)
+        except WebSocketDisconnect:
+            return
 
     return a
 

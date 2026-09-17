@@ -17,12 +17,11 @@ const nextConfig: NextConfig = {
   // Proxy API routes to the FastAPI server so the browser only ever talks to this
   // origin — works through a single forwarded port (VS Code / SSH tunnels) and makes
   // CORS irrelevant. Used when NEXT_PUBLIC_API_BASE_URL is empty/unset.
+  // Everything lives under /api so backend routes can never collide with page routes
+  // (the bare prefixes did: the /accounts page shadowed the /accounts API).
   async rewrites() {
     const target = (process.env.API_PROXY_TARGET || "http://localhost:8000").replace(/\/$/, "");
-    return ["auth", "profiles", "accounts", "tokens"].map((prefix) => ({
-      source: `/${prefix}/:path*`,
-      destination: `${target}/${prefix}/:path*`,
-    }));
+    return [{ source: "/api/:path*", destination: `${target}/:path*` }];
   },
 };
 

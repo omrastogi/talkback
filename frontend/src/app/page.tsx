@@ -63,6 +63,7 @@ export default function ChatsPage() {
   const [isLoadingTurns, setIsLoadingTurns] = useState(false)
   const [roleFilter, setRoleFilter] = useState('all')
   const [sourceFilter, setSourceFilter] = useState('all')
+  const [includeDiagnostic, setIncludeDiagnostic] = useState(false)
   const [errorMessage, setErrorMessage] = useState('')
 
   const selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) || null
@@ -95,6 +96,7 @@ export default function ChatsPage() {
     try {
       const response = await fetchSessions(profileId, {
         limit: SESSIONS_PAGE_SIZE,
+        include_diagnostic: includeDiagnostic,
         ...(before ? { before } : {})
       })
       setSessions((current) => (before ? [...current, ...response.sessions] : response.sessions))
@@ -113,7 +115,11 @@ export default function ChatsPage() {
     setIsLoadingTurns(true)
     setErrorMessage('')
     try {
-      const response = await fetchTurns(profileId, { session_id: sessionId, limit: 500 })
+      const response = await fetchTurns(profileId, {
+        session_id: sessionId,
+        limit: 500,
+        include_diagnostic: includeDiagnostic
+      })
       // The endpoint returns newest first; a conversation reads oldest first.
       setTurns([...response.turns].reverse())
     } catch (error) {
@@ -136,7 +142,7 @@ export default function ChatsPage() {
     if (!selectedProfileId) return
     void loadSessions(selectedProfileId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedProfileId])
+  }, [selectedProfileId, includeDiagnostic])
 
   useEffect(() => {
     setTurns([])
@@ -204,6 +210,15 @@ export default function ChatsPage() {
                   </option>
                 ))}
               </select>
+            </label>
+
+            <label className="auth-checkbox">
+              <input
+                checked={includeDiagnostic}
+                onChange={(event) => setIncludeDiagnostic(event.target.checked)}
+                type="checkbox"
+              />
+              <span>Show diagnostic sessions</span>
             </label>
 
             <div className="hero-stats">
